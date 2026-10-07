@@ -1,176 +1,468 @@
 <?php
-// register3.php - Step 4: Assessment & Preferences
-// Final step: validate preferences, then insert the full application into the database.
+declare(strict_types=1);
 
-session_start();
-require_once __DIR__ . '/db.php';
-require_once __DIR__ . '/gemini_ai.php';
+require_once __DIR__ . '/config/bootstrap.php';
+
+if (empty($_SESSION['sams_registration']['step1'])) {
+    header('Location: register.php');
+    exit;
+}
+if (empty($_SESSION['sams_registration']['step2'])) {
+    header('Location: register1.php');
+    exit;
+}
+
+function sams_split_full_name(string $fullName): array
+{
+    $parts = preg_split('/\s+/', trim($fullName)) ?: [];
+
+    if (count($parts) === 0) {
+        return ['', ''];
+    }
+
+    if (count($parts) === 1) {
+        return [$parts[0], ''];
+    }
+
+    $firstName = array_shift($parts);
+    $lastName = implode(' ', $parts);
+
+    return [$firstName, $lastName];
+}
+
+function sams_map_year_level(string $value): string
+{
+    return match ($value) {
+        '1' => '1st',
+        '2' => '2nd',
+        '3' => '3rd',
+        '4' => '4th',
+        '5' => '4th',
+        default => '1st',
+    };
+}
+
+function sams_registration_data(): array
+{
+    return $_SESSION['sams_registration'] ?? [];
+}
+
+
 
 $errors  = [];
 $success = false;
-$generated_schedule_preview = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+$registration = sams_registration_data();
+$step1 = $registration['step1'] ?? [];
+$step2 = $registration['step2'] ?? [];
+$step3 = $registration['step3'] ?? [];
+$step4 = $registration['step4'] ?? [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($_GET['finalize'])) {
     $work_location = trim($_POST['work_location'] ?? '');
     $skills        = trim($_POST['skills'] ?? '');
-    $agree_terms   = isset($_POST['agree_terms']);
-    $agree_privacy = isset($_POST['agree_privacy']);
-    $work_schedule = '';
+    $availabilityForm = $_POST['availability'] ?? [];
+    $availabilityEntries = [];
+    $totalAvailabilityHours = 0.0;
+    $availabilityDays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    $availabilityPeriods = ['morning', 'afternoon'];
 
     if ($work_location === '') {
         $errors['work_location'] = 'Preferred Work Location is required.';
     }
-    if (!$agree_terms) {
-        $errors['agree_terms'] = 'You must agree to the Terms and Conditions.';
+    foreach ($availabilityDays as $day) {
+        foreach ($availabilityPeriods as $period) {
+            $slot = $availabilityForm[$day][$period] ?? [];
+            if (empty($slot['enabled'])) {
+                continue;
+            }
+
+            $timeStart = trim((string) ($slot['start'] ?? ''));
+            $timeEnd = trim((string) ($slot['end'] ?? ''));
+            if (!preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $timeStart) || !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $timeEnd)) {
+                $errors['availability'] = 'Enter a valid start and end time for each selected slot.';
+                continue;
+            }
+
+            $startTimestamp = strtotime('1970-01-01 ' . $timeStart);
+            $endTimestamp = strtotime('1970-01-01 ' . $timeEnd);
+            $hours = ($endTimestamp - $startTimestamp) / 3600;
+            if ($hours < 2) {
+                $errors['availability'] = 'Each availability slot must be at least 2 hours, with the end time after the start time.';
+                continue;
+            }
+
+            $totalAvailabilityHours += $hours;
+            $availabilityEntries[] = [
+                'day_of_week' => $day,
+                'time_start' => $timeStart,
+                'time_end' => $timeEnd,
+                'notes' => substr(trim((string) ($slot['notes'] ?? '')), 0, 500),
+            ];
+        }
     }
-    if (!$agree_privacy) {
-        $errors['agree_privacy'] = 'You must consent to the Data Privacy Act.';
+
+    if (count($availabilityEntries) === 0) {
+        $errors['availability'] = 'Please choose at least one availability slot.';
+    } elseif ($totalAvailabilityHours < 10) {
+        $errors['availability'] = 'Minimum required availability is 10 hours per week.';
+    }
+
+    if (empty($step1) || empty($step2)) {
+        $errors['flow'] = 'Your registration session is incomplete. Please start again from Step 1.';
     }
 
     if (empty($errors)) {
-        // Gather all data from previous steps
-        $step1        = $_SESSION['step1']        ?? [];
-        $step2        = $_SESSION['step2']        ?? [];
-        $requirements = $_SESSION['requirements'] ?? [];
-
-        // Basic safety check: ensure required session data exists
-        if (empty($step1) || empty($step2)) {
-            $errors['session'] = 'Your session expired. Please restart the application process.';
-        } else {
-            $class_schedule_path = $requirements['class_schedule'] ?? null;
-            $autoSchedule = auto_generate_work_schedule_from_file((string) $class_schedule_path, [
-                'full_name' => (string) ($step1['full_name'] ?? ''),
-                'student_id' => (string) ($step1['student_id'] ?? ''),
-                'course' => (string) ($step2['course'] ?? ''),
-                'year_level' => (string) ($step2['year_level'] ?? ''),
+        $_SESSION['sams_registration'] = array_merge($_SESSION['sams_registration'] ?? [], [
+            'step3' => [
                 'work_location' => $work_location,
+                'skills' => $skills,
+                'availability' => $availabilityEntries,
+                'availability_form' => $availabilityForm,
+            ],
+        ]);
+
+        header('Location: register2.php');
+        exit;
+    }
+}
+
+if (isset($_GET['finalize'])) {
+    $work_location = trim((string) ($step3['work_location'] ?? ''));
+    $skills = trim((string) ($step3['skills'] ?? ''));
+
+    if (empty($step1) || empty($step2) || empty($step3) || empty($step4)) {
+        $errors['flow'] = 'Your registration session is incomplete. Please complete all four steps.';
+    }
+    if (empty($step4['agree_terms']) || empty($step4['agree_privacy'])) {
+        $errors['flow'] = 'Please agree to the Terms and Conditions and Data Privacy Act before submitting.';
+    }
+
+    if (empty($errors)) {
+        $pdo = sams_pdo();
+
+        try {
+            $email = trim((string) ($step1['email'] ?? ''));
+            $studentCode = trim((string) ($step1['student_id'] ?? ''));
+            $contactNumber = preg_replace('/\D+/', '', (string) ($step1['contact_number'] ?? ''));
+
+            if (!sams_column_exists($pdo, 'users', 'phone_number')) {
+                throw new RuntimeException('Users table must have phone_number column. Please apply the latest database migration.');
+            }
+
+            if (!sams_column_exists($pdo, 'students', 'student_id_number')) {
+                throw new RuntimeException('Students table must have student_id_number column.');
+            }
+
+            $duplicateCheck = $pdo->prepare(
+                "SELECT
+                    (SELECT COUNT(*) FROM users WHERE email = :email) AS email_count,
+                    (SELECT COUNT(*) FROM users WHERE phone_number = :phone_number) AS phone_count,
+                    (SELECT COUNT(*) FROM students WHERE student_id_number = :student_code) AS student_count"
+            );
+            $duplicateCheck->execute([
+                'email' => $email,
+                'phone_number' => $contactNumber,
+                'student_code' => $studentCode,
+            ]);
+            $duplicateCounts = $duplicateCheck->fetch() ?: ['email_count' => 0, 'student_count' => 0];
+
+            if ((int) ($duplicateCounts['email_count'] ?? 0) > 0) {
+                throw new RuntimeException('This email is already registered. Please use a different email or log in.');
+            }
+
+            if ((int) ($duplicateCounts['phone_count'] ?? 0) > 0) {
+                throw new RuntimeException('This phone number is already registered. Please use a different phone number.');
+            }
+
+            if ((int) ($duplicateCounts['student_count'] ?? 0) > 0) {
+                throw new RuntimeException('This student ID is already registered. Please use a different student ID or log in.');
+            }
+
+            $pdo->beginTransaction();
+
+            $currentTerm = sams_current_term($pdo);
+            $activeTermId = $currentTerm['term_id'] ?? false;
+
+            if ($activeTermId === false) {
+                throw new RuntimeException('No active term is configured yet. Please activate a term before accepting applications.');
+            }
+
+            $fullName = trim((string) ($step1['full_name'] ?? ''));
+            [$firstName, $lastName] = sams_split_full_name($fullName);
+            $course = trim((string) ($step2['course'] ?? ''));
+            $yearLevel = sams_map_year_level((string) ($step2['year_level'] ?? '1'));
+            $gpa = trim((string) ($step2['gpa'] ?? ''));
+
+            // Default password is the student ID. Student can change it later if you add that feature.
+            $userPasswordHash = password_hash($studentCode, PASSWORD_DEFAULT);
+            $passwordColumn = sams_first_existing_column($pdo, 'users', ['password', 'password_hash']);
+            if ($passwordColumn === null) {
+                throw new RuntimeException('Users table must have password or password_hash column.');
+            }
+
+            $userColumns = ['email', $passwordColumn, 'role', 'first_name', 'last_name', 'is_active'];
+            $userParams = [':email', ':password_value', ':role', ':first_name', ':last_name', ':is_active'];
+            $userValues = [
+                'email' => $email,
+                'password_value' => $userPasswordHash,
+                'role' => 'student',
+                'first_name' => $firstName,
+                'last_name' => $lastName,
+                'is_active' => 0,
+            ];
+
+            if (sams_column_exists($pdo, 'users', 'must_change_password')) {
+                $userColumns[] = 'must_change_password';
+                $userParams[] = ':must_change_password';
+                $userValues['must_change_password'] = 1;
+            }
+
+            $userColumns[] = 'phone_number';
+            $userParams[] = ':phone_number';
+            $userValues['phone_number'] = $contactNumber;
+
+            $userStatement = $pdo->prepare(
+                'INSERT INTO users (' . implode(', ', $userColumns) . ')
+                 VALUES (' . implode(', ', $userParams) . ')'
+            );
+            $userStatement->execute($userValues);
+
+            $userId = (int) $pdo->lastInsertId();
+
+            $studentColumns = ['user_id', 'student_id_number', 'program', 'year_level', 'current_gpa', 'is_enrolled', 'is_good_standing'];
+            $studentValues = [':user_id', ':student_code', ':program', ':year_level', ':current_gpa', ':is_enrolled', ':is_good_standing'];
+            $studentParams = [
+                'user_id' => $userId, 'student_code' => $studentCode, 'program' => $course,
+                'year_level' => $yearLevel, 'current_gpa' => $gpa !== '' ? $gpa : null,
+                'is_enrolled' => 1, 'is_good_standing' => 1,
+            ];
+            if (sams_column_exists($pdo, 'students', 'units')) {
+                $studentColumns[] = 'units';
+                $studentValues[] = ':units';
+                $studentParams['units'] = (int) ($step2['units'] ?? 0);
+            }
+            $studentStatement = $pdo->prepare(
+                'INSERT INTO students (' . implode(', ', $studentColumns) . ')
+                 VALUES (' . implode(', ', $studentValues) . ')'
+            );
+            $studentStatement->execute([
+                ...$studentParams,
+            ]);
+
+            $studentId = (int) $pdo->lastInsertId();
+
+            $applicationStatement = $pdo->prepare(
+                'INSERT INTO applications (
+                    student_id, term_id, status, preferred_office, skills, submitted_at
+                 ) VALUES (
+                    :student_id, :term_id, :status, :preferred_office, :skills, NOW()
+                 )'
+            );
+            $applicationStatement->execute([
+                'student_id' => $studentId,
+                'term_id' => (int) $activeTermId,
+                'status' => 'draft',
+                'preferred_office' => $work_location,
                 'skills' => $skills,
             ]);
 
-            if (empty($autoSchedule['ok'])) {
-                $errors['work_schedule_auto'] = (string) ($autoSchedule['error'] ?? 'Failed to auto-generate working hours from uploaded class schedule file.');
-            } else {
-                $work_schedule = (string) ($autoSchedule['schedule'] ?? '');
-                $generated_schedule_preview = $work_schedule;
+            $applicationId = (int) $pdo->lastInsertId();
+
+            $tempFolder = $step4['temp_folder'] ?? '';
+            $storedFiles = $step4['files'] ?? [];
+            $uploadBase = __DIR__ . '/uploads/documents/student_' . $studentId . '/application_' . $applicationId;
+
+            if ($tempFolder !== '' && is_dir($tempFolder) && !is_dir($uploadBase)) {
+                mkdir($uploadBase, 0777, true);
             }
 
-            if (empty($errors['work_schedule_auto'])) {
-                // Prepare insert for student_applications table
-                $stmt = $mysqli->prepare("INSERT INTO student_applications (
-                    full_name, student_id, email, contact_number, date_of_birth, gender,
-                    course, year_level, gpa, sdao_experience, hours_per_week,
-                    work_location, work_schedule, skills,
-                    resume_path, letter_intent_path, letter_consent_parent_path,
-                    recommendation_letter_path, photocopy_grades_path,
-                    class_schedule_path, good_moral_path, password_hash,
-                    created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())");
+            $documentMap = [
+                'resume' => 'resume',
+                'intent_letter' => 'letter_of_intent',
+                'parent_consent' => 'parent_consent',
+                'recommendation' => 'recommendation_letter',
+                'grades' => 'grades',
+                'class_schedule' => 'class_schedule',
+                'good_moral' => 'good_moral',
+            ];
 
-                if ($stmt) {
-                    // Prepare requirement file path variables so they can be passed by reference
-                    $resume_path               = $requirements['resume']               ?? null;
-                    $letter_intent_path        = $requirements['letter_intent']        ?? null;
-                    $letter_consent_parent_path= $requirements['letter_consent_parent']?? null;
-                    $recommendation_letter_path= $requirements['recommendation_letter']?? null;
-                    $photocopy_grades_path     = $requirements['photocopy_grades']     ?? null;
-                    $good_moral_path           = $requirements['good_moral']           ?? null;
+            if (is_array($storedFiles) && sams_column_exists($pdo, 'document_uploads', 'application_id')) {
+                $documentUserColumn = sams_first_existing_column($pdo, 'document_uploads', ['user_id', 'student_id']);
 
-                    $password_hash             = $step1['password_hash']              ?? null;
+                $documentColumns = [];
+                $documentValues = [];
 
-                    $stmt->bind_param(
-                        'ssssssssssssssssssssss',
-                        $step1['full_name'],
-                        $step1['student_id'],
-                        $step1['email'],
-                        $step1['contact_number'],
-                        $step1['date_of_birth'],
-                        $step1['gender'],
-                        $step2['course'],
-                        $step2['year_level'],
-                        $step2['gpa'],
-                        $step2['sdao_experience'],
-                        $step2['hours_per_week'],
-                        $work_location,
-                        $work_schedule,
-                        $skills,
-                        $resume_path,
-                        $letter_intent_path,
-                        $letter_consent_parent_path,
-                        $recommendation_letter_path,
-                        $photocopy_grades_path,
-                        $class_schedule_path,
-                        $good_moral_path,
-                        $password_hash
+                if ($documentUserColumn !== null) {
+                    $documentColumns[] = $documentUserColumn;
+                    $documentValues[] = ':' . $documentUserColumn;
+                }
+
+                $requiredDocumentColumns = [
+                    'application_id', 'document_type', 'original_filename',
+                    'stored_filename', 'file_path', 'file_size', 'mime_type'
+                ];
+
+                foreach ($requiredDocumentColumns as $column) {
+                    if (sams_column_exists($pdo, 'document_uploads', $column)) {
+                        $documentColumns[] = $column;
+                        $documentValues[] = ':' . $column;
+                    }
+                }
+
+                if (sams_column_exists($pdo, 'document_uploads', 'uploaded_at')) {
+                    $documentColumns[] = 'uploaded_at';
+                    $documentValues[] = 'NOW()';
+                }
+
+                if (count($documentColumns) > 0) {
+                    $documentStatement = $pdo->prepare(
+                        'INSERT INTO document_uploads (' . implode(', ', $documentColumns) . ')
+                         VALUES (' . implode(', ', $documentValues) . ')'
                     );
 
-                    if ($stmt->execute()) {
-                        $success = true;
+                    foreach ($storedFiles as $fileKey => $fileMeta) {
+                        $tempPath = $fileMeta['stored_path'] ?? '';
+                        if ($tempPath === '' || !file_exists($tempPath)) {
+                            continue;
+                        }
 
-                        // Clear application data from session
-                        unset($_SESSION['step1'], $_SESSION['step2'], $_SESSION['requirements']);
+                        if (!is_dir($uploadBase)) {
+                            mkdir($uploadBase, 0777, true);
+                        }
 
-                        // After successful submission, go to status page
-                        header('Location: status.php');
-                        exit;
-                    } else {
-                        $errors['db'] = 'Failed to save your application. Please try again.';
+                        $originalName = (string) ($fileMeta['original_name'] ?? basename($tempPath));
+                        $targetPath = $uploadBase . '/' . basename((string) ($fileMeta['stored_name'] ?? basename($tempPath)));
+
+                        if (!rename($tempPath, $targetPath)) {
+                            throw new RuntimeException('Unable to finalize uploaded file: ' . $originalName);
+                        }
+
+                        $documentData = [];
+                        if ($documentUserColumn === 'user_id') {
+                            $documentData['user_id'] = $userId;
+                        } elseif ($documentUserColumn === 'student_id') {
+                            $documentData['student_id'] = $studentId;
+                        }
+
+                        $possibleDocumentData = [
+                            'application_id' => $applicationId,
+                            'document_type' => $documentMap[$fileKey] ?? 'other',
+                            'original_filename' => $originalName,
+                            'stored_filename' => basename($targetPath),
+                            'file_path' => 'uploads/documents/student_' . $studentId . '/application_' . $applicationId . '/' . basename($targetPath),
+                            'file_size' => (int) ($fileMeta['size'] ?? 0),
+                            'mime_type' => (string) ($fileMeta['mime_type'] ?? 'application/octet-stream'),
+                        ];
+
+                        foreach ($possibleDocumentData as $column => $value) {
+                            if (in_array($column, $documentColumns, true)) {
+                                $documentData[$column] = $value;
+                            }
+                        }
+
+                        $documentStatement->execute($documentData);
                     }
-
-                    $stmt->close();
-                } else {
-                    $errors['db'] = 'Database error. Please contact the administrator.';
                 }
             }
+
+            $availabilityStatement = $pdo->prepare(
+                'INSERT INTO availability
+                    (application_id, term_id, day_of_week, start_time, end_time, notes)
+                 VALUES
+                    (:application_id, :term_id, :day_of_week, :start_time, :end_time, :notes)'
+            );
+            $totalAvailabilityHours = 0.0;
+            foreach (($step3['availability'] ?? []) as $entry) {
+                $startTimestamp = strtotime('1970-01-01 ' . (string) ($entry['time_start'] ?? ''));
+                $endTimestamp = strtotime('1970-01-01 ' . (string) ($entry['time_end'] ?? ''));
+                if ($startTimestamp === false || $endTimestamp === false || $endTimestamp <= $startTimestamp) {
+                    throw new RuntimeException('An availability time slot is invalid. Please review your schedule.');
+                }
+
+                $totalAvailabilityHours += ($endTimestamp - $startTimestamp) / 3600;
+                $availabilityStatement->execute([
+                    'application_id' => $applicationId,
+                    'term_id' => (int) $activeTermId,
+                    'day_of_week' => (string) ($entry['day_of_week'] ?? ''),
+                    'start_time' => (string) ($entry['time_start'] ?? ''),
+                    'end_time' => (string) ($entry['time_end'] ?? ''),
+                    'notes' => ($entry['notes'] ?? '') !== '' ? (string) $entry['notes'] : null,
+                ]);
+            }
+
+            if ($totalAvailabilityHours < 10) {
+                throw new RuntimeException('Minimum required availability is 10 hours per week. Please review your schedule.');
+            }
+
+            $updateApplicationStatement = $pdo->prepare(
+                "UPDATE applications
+                 SET available_hours_per_week = :available_hours,
+                     submitted_at = NOW(),
+                     status = 'pending'
+                 WHERE application_id = :application_id"
+            );
+            $updateApplicationStatement->execute([
+                'available_hours' => (int) round($totalAvailabilityHours),
+                'application_id' => $applicationId,
+            ]);
+
+            $pdo->commit();
+
+            unset($_SESSION['sams_registration']);
+            $_SESSION['registration_submission'] = [
+                'success' => true,
+                'message' => 'Your application and weekly availability have been submitted successfully.',
+                'availability_complete' => true,
+                'application_id' => $applicationId,
+                'student_id' => $studentId,
+                'term_id' => (int) $activeTermId,
+                'student_name' => $fullName,
+                'student_number' => $studentCode,
+                'course' => $course,
+                'year_level' => $yearLevel,
+                'date_submitted' => date('F j, Y'),
+                'status' => 'PENDING',
+            ];
+
+            header('Location: status.php');
+            exit;
+        } catch (Throwable $exception) {
+            if (isset($pdo) && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            $errors['flow'] = $exception->getMessage();
         }
     }
 }
 
-// Re-populate form values
-$val_location = htmlspecialchars($_POST['work_location'] ?? '');
-$val_skills   = htmlspecialchars($_POST['skills'] ?? '');
-
-function auto_generate_work_schedule_from_file(string $filePath, array $studentContext): array {
-    if (trim($filePath) === '') {
-        return [
-            'ok' => false,
-            'error' => 'No class schedule file was found from Step 3 upload.',
-        ];
-    }
-
-    $analysis = gemini_analyze_cor($filePath, $studentContext);
-    if (empty($analysis['ok'])) {
-        return [
-            'ok' => false,
-            'error' => (string) ($analysis['error'] ?? 'Unable to read and analyze uploaded class schedule file.'),
-        ];
-    }
-
-    $analysisData = $analysis['data'] ?? [];
-    $recommendedSchedule = trim((string) ($analysisData['recommended_work_schedule'] ?? ''));
-    if ($recommendedSchedule === '') {
-        return [
-            'ok' => false,
-            'error' => 'Class schedule file was read, but no valid working schedule recommendation was produced.',
-        ];
-    }
-
-    return [
-        'ok' => true,
-        'schedule' => preg_replace('/\s+/', ' ', $recommendedSchedule),
-        'analysis' => $analysisData,
-    ];
+if (!empty($errors)) {
+    error_log('register3: errors=' . json_encode($errors));
+    error_log('register3: session=' . json_encode($_SESSION['sams_registration'] ?? []));
 }
 
+$availabilityDays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+$availabilityForm = $_POST['availability'] ?? ($step3['availability_form'] ?? []);
+$selectedLocation = (string) ($_POST['work_location'] ?? ($step3['work_location'] ?? ''));
+$val_location = htmlspecialchars($selectedLocation, ENT_QUOTES, 'UTF-8');
+$val_skills = htmlspecialchars((string) ($_POST['skills'] ?? ($step3['skills'] ?? '')), ENT_QUOTES, 'UTF-8');
+
+$existingCor = $_SESSION['sams_registration']['step4']['files']['class_schedule'] ?? null;
+$hasExistingCor = !empty($existingCor['stored_path']) && file_exists($existingCor['stored_path']);
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Student Assistant Application – Step 4</title>
+    <title>Student Assistant Application – Step 3 (Preferences &amp; Availability)</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="assets/css/sams-design-system.css" />
+    <script src="assets/js/pdf.min.js"></script>
+    <script src="assets/js/nuis-cor-parser.js"></script>
     <style>
         /* =============================================
            CSS VARIABLES – Design System
@@ -437,6 +729,62 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
             gap: 24px;
         }
         .field {}
+        .availability-section {
+            display: grid;
+            gap: 16px;
+        }
+        .availability-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .availability-day {
+            border: 1px solid var(--color-border);
+            border-radius: 12px;
+            padding: 14px;
+            background: #fff;
+        }
+        .availability-day h3 {
+            margin: 0 0 12px;
+            font-size: var(--font-base);
+        }
+        .availability-slot {
+            display: grid;
+            grid-template-columns: auto 1fr 1fr;
+            gap: 8px;
+            align-items: center;
+            padding: 10px 0;
+            border-top: 1px solid var(--color-border);
+        }
+        .availability-slot label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: var(--font-sm);
+            font-weight: 700;
+        }
+        .availability-slot input[type="time"] {
+            width: 100%;
+            min-width: 0;
+            padding: 8px;
+            border: 1px solid var(--color-border);
+            border-radius: 8px;
+            font: inherit;
+        }
+        .availability-slot textarea {
+            grid-column: 2 / -1;
+            width: 100%;
+            min-height: 48px;
+            padding: 8px;
+            border: 1px solid var(--color-border);
+            border-radius: 8px;
+            font: inherit;
+            resize: vertical;
+        }
+        .availability-error {
+            color: #b91c1c;
+            font-weight: 700;
+        }
         .field__label {
             display: block;
             font-size: var(--font-sm);
@@ -489,6 +837,51 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
         .field__textarea::placeholder {
             color: var(--color-placeholder);
             font-weight: 500;
+        }
+
+        /* =============================================
+           SKILL TAGS SELECTOR
+         ============================================= */
+        .skills-hint {
+            font-size: var(--font-xs);
+            color: var(--color-muted);
+            margin-bottom: 12px;
+        }
+        .skill-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 8px;
+        }
+        .skill-tag {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 18px;
+            font-size: var(--font-sm);
+            font-weight: 700;
+            color: var(--color-label);
+            background: var(--color-white);
+            border: 2px solid var(--color-border);
+            border-radius: var(--radius-pill);
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+            user-select: none;
+        }
+        .skill-tag:hover {
+            color: var(--color-primary);
+            border-color: var(--color-primary);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0, 48, 135, 0.08);
+        }
+        .skill-tag:active {
+            transform: translateY(0) scale(0.96);
+        }
+        .skill-tag--active {
+            color: var(--color-white) !important;
+            background: var(--gradient-primary) !important;
+            border-color: var(--color-primary) !important;
+            box-shadow: 0 4px 12px rgba(0, 48, 135, 0.2) !important;
         }
 
         .field__error {
@@ -569,76 +962,192 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
         }
 
         /* =============================================
-           CLASS / WORKING HOURS AVAILABILITY GRID
+           NUIS COR SCANNER COMPONENT STYLES
         ============================================= */
-        .availability {
-            margin-top: 12px;
-            border: 1px solid var(--color-border);
-            border-radius: var(--radius-info);
-            padding: 16px;
+        .cor-scanner-card {
+            background: linear-gradient(135deg, #f0f7ff 0%, #ffffff 100%);
+            border: 2px dashed #93c5fd;
+            border-radius: var(--radius-card);
+            padding: 22px 24px;
+            margin-bottom: 22px;
+            box-shadow: 0 4px 14px rgba(0, 48, 135, 0.04);
+            transition: all 0.25s ease;
+        }
+        .cor-scanner-card:hover {
+            border-color: var(--color-primary);
+            box-shadow: 0 6px 18px rgba(0, 48, 135, 0.08);
+        }
+        .cor-scanner-header {
             display: flex;
-            flex-direction: column;
-            gap: 12px;
-            background: #f9fafb;
-        }
-        .availability__hint {
-            font-size: var(--font-sm);
-            color: var(--color-muted);
-            margin: 4px 0 8px;
-        }
-        .availability__header {
-            display: grid;
-            grid-template-columns: 120px 1fr 1.2fr;
-            font-size: var(--font-xs);
-            font-weight: 700;
-            color: var(--color-label);
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-        }
-        .availability__row {
-            display: grid;
-            grid-template-columns: 120px 1fr 1.2fr;
-            gap: 12px;
             align-items: flex-start;
-            padding-top: 4px;
-            border-top: 1px solid #e5e7eb;
+            gap: 14px;
+            margin-bottom: 16px;
         }
-        .availability__day {
+        .cor-scanner-icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: var(--gradient-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            color: #ffffff;
+            box-shadow: 0 4px 10px rgba(0, 48, 135, 0.2);
+        }
+        .cor-scanner-title {
+            font-size: var(--font-base);
+            font-weight: 700;
+            color: var(--color-heading);
+            margin-bottom: 3px;
+        }
+        .cor-scanner-desc {
+            font-size: var(--font-sm);
+            color: var(--color-body);
+            line-height: var(--lh-sm);
+        }
+        .cor-dropzone {
+            background: #ffffff;
+            border: 2px dashed #cbd5e1;
+            border-radius: var(--radius-step);
+            padding: 20px 16px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            outline: none;
+        }
+        .cor-dropzone:hover, .cor-dropzone--dragover, .cor-dropzone:focus-visible {
+            border-color: var(--color-primary);
+            background: #eff6ff;
+        }
+        .cor-dropzone-icon {
+            margin: 0 auto 8px;
+            display: block;
+        }
+        .cor-dropzone-title {
             font-size: var(--font-sm);
             font-weight: 700;
-            color: var(--color-label);
+            color: var(--color-primary);
         }
-        .availability__slots {
+        .cor-dropzone-hint {
+            font-size: var(--font-xs);
+            color: var(--color-muted);
+            margin-top: 4px;
+        }
+        .cor-loading-banner {
             display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            padding: 16px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            border-radius: var(--radius-step);
+            color: var(--color-primary);
+            font-weight: 600;
+            font-size: var(--font-sm);
+            margin-top: 12px;
         }
-        .availability__slot {
+        .cor-spinner {
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0,48,135,0.2);
+            border-top-color: var(--color-primary);
+            border-radius: 50%;
+            animation: cor-spin 0.8s linear infinite;
+        }
+        @keyframes cor-spin {
+            to { transform: rotate(360deg); }
+        }
+        .cor-success-panel {
+            background: #f0fdf4;
+            border: 1.5px solid #86efac;
+            border-radius: var(--radius-step);
+            padding: 16px;
+            margin-top: 14px;
+        }
+        .cor-success-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .cor-badge-student {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
-            padding: 4px 8px;
-            border-radius: 9999px;
+            gap: 6px;
+            background: #dcfce7;
+            color: #166534;
+            padding: 4px 10px;
+            border-radius: var(--radius-pill);
+            font-size: var(--font-xs);
+            font-weight: 700;
+        }
+        .cor-schedule-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 6px;
+        }
+        .cor-chip {
             background: #ffffff;
-            border: 1px solid #e5e7eb;
-            font-size: var(--font-xs);
-            cursor: pointer;
+            border: 1px solid #cbd5e1;
+            padding: 5px 10px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #1e293b;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
         }
-        .availability__slot input {
-            width: 14px;
-            height: 14px;
-            accent-color: var(--color-primary);
+        .cor-chip strong {
+            color: var(--color-primary);
         }
-        .availability__summary {
-            font-size: var(--font-xs);
-            color: var(--color-body);
+        .cor-adjustment-notice {
+            background: #fffbeb;
+            border: 1.5px solid #fde047;
+            border-radius: var(--radius-step);
+            padding: 14px 18px;
+            margin-top: 14px;
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            font-size: var(--font-sm);
+            color: #854d0e;
+            line-height: var(--lh-sm);
         }
-
-        @media (max-width: 768px) {
-            .availability__header,
-            .availability__row {
-                grid-template-columns: 1fr;
-            }
+        .slot-conflict-badge {
+            display: inline-block;
+            margin-top: 4px;
+            padding: 3px 8px;
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fca5a5;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .slot-free-badge {
+            display: inline-block;
+            margin-top: 4px;
+            padding: 3px 8px;
+            background: #dcfce7;
+            color: #166534;
+            border: 1px solid #86efac;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .availability-slot--modified {
+            border: 2px solid #f59e0b !important;
+            border-radius: 10px;
+            padding: 8px;
+            background: #fffdf5;
+        }
+        .availability-slot--modified textarea {
+            border-color: #f59e0b !important;
+            box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2) !important;
         }
 
         /* =============================================
@@ -690,7 +1199,7 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
         .btn-submit__icon { width: 20px; height: 20px; flex-shrink: 0; }
 
         /* =============================================
-           STATUS BANNERS
+           SUCCESS BANNER
         ============================================= */
         .success-banner {
             background: #dcfce7;
@@ -700,16 +1209,6 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
             font-size: var(--font-sm);
             font-weight: 700;
             color: #15803d;
-            text-align: center;
-        }
-        .error-banner {
-            background: #fee2e2;
-            border: 2px solid #dc2626;
-            border-radius: var(--radius-card);
-            padding: 16px 24px;
-            font-size: var(--font-sm);
-            font-weight: 700;
-            color: #b91c1c;
             text-align: center;
         }
 
@@ -793,6 +1292,7 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
 
             .progress-card { padding: 20px 16px 16px; }
             .steps { grid-template-columns: repeat(2, 1fr); }
+            .availability-grid { grid-template-columns: 1fr; }
 
             .form-card { padding: 20px 16px; }
             .section-heading__title { font-size: 18px; }
@@ -832,31 +1332,25 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
                 <li><a href="index.php"     class="nav__item">Home</a></li>
                 <li><a href="register.php"  class="nav__item">Personal Info</a></li>
                 <li><a href="register1.php" class="nav__item">Academic Info</a></li>
-                <li><a href="register2.php" class="nav__item">Requirements</a></li>
                 <li><a href="register3.php" class="nav__item nav__item--active" aria-current="page">Assessment</a></li>
+                <li><a href="register2.php" class="nav__item">Requirements</a></li>
             </ul>
         </nav>
     </div>
 
     <div class="container">
 
-        <?php if (!empty($errors['session'])): ?>
-        <div class="error-banner" role="alert">
-            <?= htmlspecialchars($errors['session']) ?>
-        </div>
-        <?php endif; ?>
-
-        <?php if (!empty($errors['db'])): ?>
-        <div class="error-banner" role="alert">
-            <?= htmlspecialchars($errors['db']) ?>
-        </div>
-        <?php endif; ?>
-
         <?php if ($success): ?>
         <div class="success-banner" role="alert">
             ✓ Application submitted successfully! We will review your application and get back to you.
         </div>
         <?php endif; ?>
+
+                <?php if (!empty($errors['flow'])): ?>
+                    <div style="background:#fff0f0;border:2px solid #fca5a5;color:#881818;border-radius:12px;padding:12px 16px;margin-bottom:16px;" role="alert">
+                        <?= htmlspecialchars($errors['flow']) ?>
+                    </div>
+                <?php endif; ?>
 
         <!-- ── HERO ── -->
         <header class="hero">
@@ -874,10 +1368,10 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
         <!-- ── PROGRESS CARD ── -->
         <section class="progress-card" aria-label="Application progress">
             <div class="progress-card__header">
-                <span class="progress-card__step-label">Step 4 of 4</span>
-                <span class="progress-card__pct-label">100% Complete</span>
+                <span class="progress-card__step-label">Step 3 of 4</span>
+                <span class="progress-card__pct-label">75% Complete</span>
             </div>
-            <div class="progress-card__bar-track" role="progressbar" aria-valuenow="100" aria-valuemin="0" aria-valuemax="100" aria-label="100% complete">
+            <div class="progress-card__bar-track" role="progressbar" aria-valuenow="75" aria-valuemin="0" aria-valuemax="100" aria-label="75% complete">
                 <div class="progress-card__bar-fill"></div>
             </div>
 
@@ -899,8 +1393,8 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
                     <span class="step__label">Academic Info</span>
                 </a>
 
-                <!-- Step 3 – Requirements (completed) -->
-                <a href="register2.php" class="step step--active" role="listitem">
+                <!-- Step 3 – Assessment (current) -->
+                <div class="step step--active" role="listitem" aria-current="step">
                     <svg class="step__icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                         <path d="M14 2H6C5.46957 2 4.96086 2.21071 4.58579 2.58579C4.21071 2.96086 4 3.46957 4 4V20C4 20.5304 4.21071 21.0391 4.58579 21.4142C4.96086 21.7893 5.46957 22 6 22H18C18.5304 22 19.0391 21.7893 19.4142 21.4142C19.7893 21.0391 20 20.5304 20 20V8L14 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                         <path d="M14 2V8H20" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -908,19 +1402,19 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
                         <path d="M16 17H8" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                         <path d="M10 9H8" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
-                    <span class="step__label">Requirements</span>
-                </a>
+                    <span class="step__label">Assessment</span>
+                </div>
 
-                <!-- Step 4 – Assessment (current / active) -->
-                <div class="step step--active" role="listitem" aria-current="step">
+                <!-- Step 4 – Requirements (upcoming) -->
+                <a href="register2.php" class="step step--inactive" role="listitem">
                     <svg class="step__icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                         <rect x="3" y="3" width="18" height="18" rx="2" stroke="white" stroke-width="2"/>
                         <path d="M9 9H15" stroke="white" stroke-width="2" stroke-linecap="round"/>
                         <path d="M9 12H15" stroke="white" stroke-width="2" stroke-linecap="round"/>
                         <path d="M9 15H12" stroke="white" stroke-width="2" stroke-linecap="round"/>
                     </svg>
-                    <span class="step__label">Assessment</span>
-                </div>
+                    <span class="step__label">Requirements</span>
+                </a>
             </div>
         </section>
 
@@ -941,103 +1435,177 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
 
                     <!-- Preferred Work Location -->
                     <div class="field">
-                        <label class="field__label" for="work_location">Preferred Work Location *</label>
+                        <label class="field__label" for="work_location">Preferred Office Assignment *</label>
                         <select
-                            class="field__select<?= !empty($errors['work_location']) ? ' field__select--error' : '' ?>"
-                            id="work_location"
-                            name="work_location"
-                            aria-required="true"
-                            aria-describedby="<?= !empty($errors['work_location']) ? 'work-location-error' : '' ?>"
-                        >
-                            <option value="" <?= $val_location === '' ? 'selected' : '' ?>>Select location...</option>
-                            <option value="on_campus"  <?= $val_location === 'on_campus'  ? 'selected' : '' ?>>On Campus</option>
-                            <option value="off_campus" <?= $val_location === 'off_campus' ? 'selected' : '' ?>>Off Campus</option>
-                            <option value="hybrid"     <?= $val_location === 'hybrid'     ? 'selected' : '' ?>>Hybrid</option>
-                            <option value="remote"     <?= $val_location === 'remote'     ? 'selected' : '' ?>>Remote</option>
-                        </select>
+    class="field__select<?= !empty($errors['work_location']) ? ' field__select--error' : '' ?>"
+    id="work_location"
+    name="work_location"
+    aria-required="true"
+>
+
+<option value="">Select office...</option>
+
+<?php foreach (sams_office_options() as $officeOption): ?>
+<option value="<?= htmlspecialchars($officeOption, ENT_QUOTES, 'UTF-8') ?>" <?= $selectedLocation === $officeOption ? 'selected' : '' ?>><?= htmlspecialchars($officeOption, ENT_QUOTES, 'UTF-8') ?></option>
+<?php endforeach; ?>
+
+</select>
                         <?php if (!empty($errors['work_location'])): ?>
                             <span class="field__error" id="work-location-error" role="alert"><?= htmlspecialchars($errors['work_location']) ?></span>
                         <?php endif; ?>
                     </div>
 
-                    <!-- Auto schedule generation notice -->
-                    <div class="field">
-                        <label class="field__label">Working Hours Schedule (Auto-generated)</label>
-                        <div class="auto-rec" style="margin-top:8px;">
-                            <svg class="auto-rec__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                                <circle cx="10" cy="10" r="9" stroke="#f59e0b" stroke-width="1.5"/>
-                                <path d="M10 5.8v4.2" stroke="#f59e0b" stroke-width="1.7" stroke-linecap="round"/>
-                                <circle cx="10" cy="13.8" r="1" fill="#f59e0b"/>
-                            </svg>
-                            <p class="auto-rec__text">
-                                Your working hours will be generated automatically from the class schedule file uploaded in Step 3.
-                                No manual class-hour listing is required on this page.
-                            </p>
+                    <!-- Preferred Work Schedule removed per request -->
+
+                    <!-- ── NUIS Lipa COR Scanner Card ── -->
+                    <div class="cor-scanner-card" id="cor-scanner-card">
+                        <div class="cor-scanner-header">
+                            <div class="cor-scanner-icon" aria-hidden="true">
+                                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                                    <polyline points="14 2 14 8 20 8"></polyline>
+                                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                                    <polyline points="10 9 9 9 8 9"></polyline>
+                                </svg>
+                            </div>
+                            <div>
+                                <h3 class="cor-scanner-title">Auto-Detect Availability from NUIS Lipa COR</h3>
+                                <p class="cor-scanner-desc">
+                                    Upload your downloaded <strong>Certificate of Registration (PDF)</strong> from NUIS Lipa.
+                                    The system will automatically detect your class schedule, identify your free hours, and check your availability slots below.
+                                </p>
+                            </div>
                         </div>
-                        <?php if (!empty($errors['work_schedule_auto'])): ?>
-                            <span class="field__error" role="alert"><?= htmlspecialchars($errors['work_schedule_auto']) ?></span>
+
+                        <!-- Dropzone -->
+                        <div class="cor-dropzone" id="cor-dropzone" tabindex="0" role="button" aria-label="Upload COR PDF to detect schedule">
+                            <input type="file" id="cor-file-input" accept="application/pdf" style="display:none;" />
+                            <svg class="cor-dropzone-icon" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#003087" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="17 8 12 3 7 8"></polyline>
+                                <line x1="12" y1="3" x2="12" y2="15"></line>
+                            </svg>
+                            <div class="cor-dropzone-title">Click to upload your NUIS Lipa COR PDF (or drag and drop here)</div>
+                            <div class="cor-dropzone-hint">Official NUIS Lipa COR PDF documents (Max 5MB)</div>
+                            <?php if ($hasExistingCor): ?>
+                                <div style="margin-top:8px;font-size:12px;font-weight:700;color:#166534;" id="cor-existing-label">
+                                    ✓ Saved in session: <?= htmlspecialchars($existingCor['original_name'] ?? 'COR.pdf') ?> (Click to upload different COR)
+                                </div>
+                            <?php endif; ?>
+                        </div>
+
+                        <!-- Loading indicator -->
+                        <div id="cor-loading" style="display:none;" class="cor-loading-banner">
+                            <span class="cor-spinner"></span>
+                            <span>Reading NUIS Lipa COR and calculating available hours...</span>
+                        </div>
+
+                        <!-- Success result panel -->
+                        <div id="cor-success-panel" style="display:none;" class="cor-success-panel">
+                            <div class="cor-success-header">
+                                <div style="display:flex;align-items:center;gap:8px;">
+                                    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="#16a34a" stroke-width="2.5"><polyline points="4 11 8 15 16 6"/></svg>
+                                    <strong style="color:#166534;font-size:14px;">COR Schedule Detected &amp; Applied!</strong>
+                                </div>
+                                <div id="cor-student-badge" class="cor-badge-student"></div>
+                            </div>
+                            <div style="font-size:13px;color:#334155;margin-bottom:6px;">
+                                Found <strong id="cor-class-count">0</strong> scheduled class sessions:
+                            </div>
+                            <div id="cor-chips-list" class="cor-schedule-chips"></div>
+                            <div style="margin-top:12px;font-size:12px;color:#166534;font-weight:600;">
+                                ✓ Your free time slots have been automatically checked below. You can still modify them if needed.
+                            </div>
+                        </div>
+
+                        <!-- Schedule Adjustment / Reason Notice -->
+                        <div id="cor-adjustment-notice" style="display:none;" class="cor-adjustment-notice">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2" style="flex-shrink:0;margin-top:2px;">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="12" y1="8" x2="12" y2="12"></line>
+                                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                            </svg>
+                            <div>
+                                <strong>Schedule Adjusted from COR:</strong>
+                                <span>You modified your availability from your official COR schedule. Please explain your reason in the <strong>Notes</strong> box of the adjusted day (e.g. commute/travel time, part-time job, organization duties).</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="field availability-section">
+                        <div>
+                            <label class="field__label">Weekly Availability *</label>
+                            <p>Select your available morning and/or afternoon hours. Each selected slot must be at least 2 hours, with at least 10 hours total per week.</p>
+                            <p id="monthly-hours-preview" style="margin-top:8px;font-weight:700;color:#1e3a8a;" role="status"></p>
+                        </div>
+                        <?php if (!empty($errors['availability'])): ?>
+                            <span class="availability-error" role="alert"><?= htmlspecialchars($errors['availability'], ENT_QUOTES, 'UTF-8') ?></span>
                         <?php endif; ?>
-                        <?php if ($generated_schedule_preview !== ''): ?>
-                            <p class="availability__hint" style="margin-top:10px;">
-                                Generated schedule preview: <strong><?= htmlspecialchars($generated_schedule_preview) ?></strong>
-                            </p>
-                        <?php endif; ?>
+                        <div class="availability-grid">
+                            <?php foreach ($availabilityDays as $day): ?>
+                                <?php $dayValues = $availabilityForm[$day] ?? []; ?>
+                                <section class="availability-day" aria-label="<?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?> availability">
+                                    <h3><?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?></h3>
+                                    <?php foreach (['morning' => ['Morning', '08:00', '12:00'], 'afternoon' => ['Afternoon', '13:00', '20:00']] as $period => [$periodLabel, $defaultStart, $defaultEnd]): ?>
+                                        <?php
+                                            $slotValues = $dayValues[$period] ?? [];
+                                            $slotEnabled = array_key_exists('enabled', $slotValues)
+                                                ? !empty($slotValues['enabled'])
+                                                : ($period === 'morning' && empty($availabilityForm));
+                                        ?>
+                                        <div class="availability-slot" data-day="<?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?>" data-period="<?= $period ?>">
+                                            <label>
+                                                <input type="checkbox" name="availability[<?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?>][<?= $period ?>][enabled]" value="1" <?= $slotEnabled ? 'checked' : '' ?> />
+                                                <?= htmlspecialchars($periodLabel, ENT_QUOTES, 'UTF-8') ?>
+                                            </label>
+                                            <div class="slot-conflict-container" id="conflict-tag-<?= strtolower($day) ?>-<?= $period ?>"></div>
+                                            <input type="time" name="availability[<?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?>][<?= $period ?>][start]" value="<?= htmlspecialchars((string) ($slotValues['start'] ?? $defaultStart), ENT_QUOTES, 'UTF-8') ?>" aria-label="<?= htmlspecialchars($day . ' ' . $periodLabel . ' start time', ENT_QUOTES, 'UTF-8') ?>" />
+                                            <input type="time" name="availability[<?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?>][<?= $period ?>][end]" value="<?= htmlspecialchars((string) ($slotValues['end'] ?? $defaultEnd), ENT_QUOTES, 'UTF-8') ?>" aria-label="<?= htmlspecialchars($day . ' ' . $periodLabel . ' end time', ENT_QUOTES, 'UTF-8') ?>" />
+                                            <textarea name="availability[<?= htmlspecialchars($day, ENT_QUOTES, 'UTF-8') ?>][<?= $period ?>][notes]" maxlength="500" placeholder="Notes / reason for adjustment (if schedule differs from COR)" aria-label="<?= htmlspecialchars($day . ' ' . $periodLabel . ' note', ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars((string) ($slotValues['notes'] ?? ''), ENT_QUOTES, 'UTF-8') ?></textarea>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </section>
+                            <?php endforeach; ?>
+                        </div>
                     </div>
 
                     <!-- Special Skills or Talents -->
                     <div class="field">
-                        <label class="field__label" for="skills">Special Skills or Talents</label>
-                        <textarea
-                            class="field__textarea"
-                            id="skills"
-                            name="skills"
-                            placeholder="e.g., Event planning, graphic design, public speaking..."
-                            aria-label="Special skills or talents"
-                        ><?= $val_skills ?></textarea>
-                    </div>
-
-                    <!-- Checkboxes -->
-                    <div class="checkboxes">
-                        <div>
-                            <div class="checkbox-row">
-                                <input
-                                    class="checkbox-row__input"
-                                    type="checkbox"
-                                    id="agree_terms"
-                                    name="agree_terms"
-                                    value="1"
-                                    <?= (isset($_POST['agree_terms'])) ? 'checked' : '' ?>
-                                    aria-required="true"
-                                    aria-describedby="<?= !empty($errors['agree_terms']) ? 'terms-error' : '' ?>"
-                                />
-                                <label class="checkbox-row__label" for="agree_terms">
-                                    I agree to the <strong>Terms and Conditions</strong> of the Student Assistant Program and understand my responsibilities as a student assistant.
-                                </label>
-                            </div>
-                            <?php if (!empty($errors['agree_terms'])): ?>
-                                <span class="checkbox-error" id="terms-error" role="alert"><?= htmlspecialchars($errors['agree_terms']) ?></span>
-                            <?php endif; ?>
-                        </div>
-
-                        <div>
-                            <div class="checkbox-row">
-                                <input
-                                    class="checkbox-row__input"
-                                    type="checkbox"
-                                    id="agree_privacy"
-                                    name="agree_privacy"
-                                    value="1"
-                                    <?= (isset($_POST['agree_privacy'])) ? 'checked' : '' ?>
-                                    aria-required="true"
-                                    aria-describedby="<?= !empty($errors['agree_privacy']) ? 'privacy-error' : '' ?>"
-                                />
-                                <label class="checkbox-row__label" for="agree_privacy">
-                                    I consent to the collection and processing of my personal data in accordance with the <strong>Data Privacy Act</strong> for SDAO purposes.
-                                </label>
-                            </div>
-                            <?php if (!empty($errors['agree_privacy'])): ?>
-                                <span class="checkbox-error" id="privacy-error" role="alert"><?= htmlspecialchars($errors['agree_privacy']) ?></span>
-                            <?php endif; ?>
+                        <label class="field__label">Special Skills or Talents</label>
+                        <div class="skills-hint">Select the skills that apply to you:</div>
+                        <input type="hidden" name="skills" id="skills" value="<?= $val_skills ?>">
+                        <div class="skill-tags" role="group" aria-label="Skills selector">
+                            <?php
+                            $available_skills = [
+                                'Time Management',
+                                'Teamwork',
+                                'Leadership',
+                                'Problem Solving',
+                                'Adaptability',
+                                'Attention to Detail',
+                                'Multitasking',
+                                'Organization'
+                            ];
+                            
+                            // Parse currently selected skills
+                            $selected_skills = [];
+                            if ($val_skills !== '') {
+                                $selected_skills = array_map('trim', explode(',', $val_skills));
+                            }
+                            
+                            foreach ($available_skills as $skill):
+                                $isActive = in_array($skill, $selected_skills, true);
+                            ?>
+                                <button 
+                                    type="button" 
+                                    class="skill-tag<?= $isActive ? ' skill-tag--active' : '' ?>" 
+                                    data-skill="<?= htmlspecialchars($skill, ENT_QUOTES, 'UTF-8') ?>"
+                                    aria-pressed="<?= $isActive ? 'true' : 'false' ?>"
+                                >
+                                    <?= htmlspecialchars($skill, ENT_QUOTES, 'UTF-8') ?>
+                                </button>
+                            <?php endforeach; ?>
                         </div>
                     </div>
 
@@ -1056,7 +1624,7 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
 
                 <!-- ── ACTIONS ── -->
                 <div class="actions" style="margin-top: 32px;">
-                    <a href="register2.php" class="btn-back">
+                    <a href="register1.php" class="btn-back">
                         <svg class="btn-back__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                             <path d="M15.8333 10H4.16667M4.16667 10L10 15.8333M4.16667 10L10 4.16667" stroke="#003087" stroke-width="1.67" stroke-linecap="round" stroke-linejoin="round"/>
                         </svg>
@@ -1064,12 +1632,10 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
                     </a>
 
                     <button type="submit" class="btn-submit">
-                        <!-- Checkmark-circle icon matching Figma imgIcon2 -->
+                        Next
                         <svg class="btn-submit__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                            <circle cx="10" cy="10" r="8" stroke="#003087" stroke-width="1.67"/>
-                            <path d="M6.5 10.5L8.5 12.5L13.5 7.5" stroke="#003087" stroke-width="1.67" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M4.16667 10H15.8333M15.8333 10L10 4.16667M15.8333 10L10 15.8333" stroke="#003087" stroke-width="1.67" stroke-linecap="round" stroke-linejoin="round"/>
                         </svg>
-                        Submit Application
                     </button>
                 </div>
 
@@ -1103,7 +1669,314 @@ function auto_generate_work_schedule_from_file(string $filePath, array $studentC
         });
     }
 
+    /* ── Skill Tags Toggle ── */
+    var skillInput = document.getElementById('skills');
+    var skillTags  = document.querySelectorAll('.skill-tag');
+
+    if (skillInput && skillTags.length > 0) {
+        skillTags.forEach(function (tag) {
+            tag.addEventListener('click', function () {
+                var isPressed = this.getAttribute('aria-pressed') === 'true';
+                this.setAttribute('aria-pressed', String(!isPressed));
+                this.classList.toggle('skill-tag--active', !isPressed);
+
+                // Update hidden input value
+                var selected = [];
+                document.querySelectorAll('.skill-tag--active').forEach(function (activeTag) {
+                    selected.push(activeTag.getAttribute('data-skill'));
+                });
+                skillInput.value = selected.join(', ');
+            });
+        });
+    }
+
 })();
+</script>
+
+<script>
+(function () {
+    var preview = document.getElementById('monthly-hours-preview');
+    var units = <?= (int) ($step2['units'] ?? 0) ?>;
+    var minimum = units <= 14 ? 100 : (units <= 18 ? 75 : 50);
+
+    function updatePreview() {
+        if (!preview) return;
+        var total = 0;
+        document.querySelectorAll('.availability-slot').forEach(function (slot) {
+            var checkbox = slot.querySelector('input[type="checkbox"]');
+            var times = slot.querySelectorAll('input[type="time"]');
+            if (!checkbox || !checkbox.checked || times.length !== 2) return;
+            var start = times[0].value.split(':');
+            var end = times[1].value.split(':');
+            if (start.length !== 2 || end.length !== 2) return;
+            var hours = ((parseInt(end[0], 10) * 60 + parseInt(end[1], 10)) -
+                (parseInt(start[0], 10) * 60 + parseInt(start[1], 10))) / 60;
+            if (hours > 0) total += hours;
+        });
+        var monthly = total * 4.33;
+        preview.textContent = 'Possible duty: ' + monthly.toFixed(1) + ' hours/month. Minimum for ' + units + ' units: ' + minimum + ' hours/month' + (monthly < minimum ? ' - warning: below minimum.' : ' - meets minimum.');
+        preview.style.color = monthly < minimum ? '#991b1b' : '#166534';
+    }
+
+    document.querySelectorAll('.availability-slot input').forEach(function (input) {
+        input.addEventListener('input', updatePreview);
+        input.addEventListener('change', updatePreview);
+    });
+    updatePreview();
+
+    /* ── NUIS COR Scanner Integration ── */
+    var corDropzone = document.getElementById('cor-dropzone');
+    var corFileInput = document.getElementById('cor-file-input');
+    var corLoading = document.getElementById('cor-loading');
+    var corSuccessPanel = document.getElementById('cor-success-panel');
+    var corStudentBadge = document.getElementById('cor-student-badge');
+    var corClassCount = document.getElementById('cor-class-count');
+    var corChipsList = document.getElementById('cor-chips-list');
+    var corAdjustmentNotice = document.getElementById('cor-adjustment-notice');
+
+    var corBaseline = null; // Stores parsed baseline { Day: { morning: { enabled, start, end }, afternoon: { ... } } }
+    var corClassSchedules = []; // Stores all detected classes
+
+    function formatTime12(timeStr) {
+        if (!timeStr) return '';
+        var parts = timeStr.split(':');
+        if (parts.length < 2) return timeStr;
+        var h = parseInt(parts[0], 10);
+        var m = parts[1];
+        var ampm = h >= 12 ? 'PM' : 'AM';
+        h = h % 12;
+        if (h === 0) h = 12;
+        return (h < 10 ? '0' + h : h) + ':' + m + ' ' + ampm;
+    }
+
+    /**
+     * Dynamically recalculate slot conflict against class schedules in real-time
+     */
+    function updateSlotConflictBadge(slot) {
+        if (!slot) return;
+        var day = slot.getAttribute('data-day');
+        var period = slot.getAttribute('data-period');
+        var conflictContainer = document.getElementById('conflict-tag-' + day.toLowerCase() + '-' + period);
+        if (!conflictContainer) return;
+
+        // If no COR has been uploaded yet, don't show badges
+        if (!corClassSchedules || corClassSchedules.length === 0) {
+            conflictContainer.innerHTML = '';
+            return;
+        }
+
+        var times = slot.querySelectorAll('input[type="time"]');
+        if (times.length < 2) return;
+        var startTime = times[0].value;
+        var endTime = times[1].value;
+
+        if (!window.NuisCorParser || !window.NuisCorParser.checkSlotConflict) return;
+
+        var check = window.NuisCorParser.checkSlotConflict(day, startTime, endTime, corClassSchedules);
+        if (!check.valid) {
+            conflictContainer.innerHTML = '<span class="slot-conflict-badge">⚠️ ' + check.message + '</span>';
+            return;
+        }
+
+        if (check.isFree) {
+            // TURNS GREEN WHEN NO OVERLAP!
+            if (check.hasMinDuration) {
+                conflictContainer.innerHTML = '<span class="slot-free-badge">✓ Free (No class ' + formatTime12(startTime) + ' - ' + formatTime12(endTime) + ')</span>';
+            } else {
+                conflictContainer.innerHTML = '<span class="slot-conflict-badge" style="background:#fef3c7;color:#92400e;border-color:#fde68a;">⚠️ ' + check.durationHours.toFixed(1) + ' hrs (Min. 2 hrs required)</span>';
+            }
+        } else {
+            // TURNS RED IF OVERLAPS WITH A CLASS
+            conflictContainer.innerHTML = '<span class="slot-conflict-badge">⚠️ Class: ' + check.conflicts.join(', ') + '</span>';
+        }
+    }
+
+    if (corDropzone && corFileInput) {
+        corDropzone.addEventListener('click', function () {
+            corFileInput.click();
+        });
+        corDropzone.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                corFileInput.click();
+            }
+        });
+
+        corDropzone.addEventListener('dragover', function (e) {
+            e.preventDefault();
+            this.classList.add('cor-dropzone--dragover');
+        });
+        corDropzone.addEventListener('dragleave', function () {
+            this.classList.remove('cor-dropzone--dragover');
+        });
+        corDropzone.addEventListener('drop', function (e) {
+            e.preventDefault();
+            this.classList.remove('cor-dropzone--dragover');
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                handleCorFile(e.dataTransfer.files[0]);
+            }
+        });
+
+        corFileInput.addEventListener('change', function () {
+            if (this.files && this.files.length > 0) {
+                handleCorFile(this.files[0]);
+            }
+        });
+    }
+
+    async function handleCorFile(file) {
+        if (!file) return;
+        if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+            alert('Please select a valid PDF file of your NUIS Lipa Certificate of Registration.');
+            return;
+        }
+
+        corLoading.style.display = 'flex';
+        corSuccessPanel.style.display = 'none';
+
+        try {
+            // 1. Upload to server session for Step 4 preservation
+            var uploadFormData = new FormData();
+            uploadFormData.append('cor_file', file);
+            fetch('api/upload_cor.php', {
+                method: 'POST',
+                body: uploadFormData
+            }).catch(function (err) {
+                console.warn('Background COR session save failed:', err);
+            });
+
+            // 2. Parse client-side via NuisCorParser
+            if (!window.NuisCorParser) {
+                throw new Error('COR Parser script not loaded.');
+            }
+
+            var result = await window.NuisCorParser.parseNuisCorPdf(file);
+            applyCorResult(result, file.name);
+
+        } catch (err) {
+            console.error('Failed to parse COR PDF:', err);
+            alert('Could not parse COR schedule: ' + err.message + '\nPlease verify you uploaded an official NUIS Lipa Certificate of Registration PDF.');
+        } finally {
+            corLoading.style.display = 'none';
+        }
+    }
+
+    function applyCorResult(result, filename) {
+        corBaseline = {};
+        corClassSchedules = result.classSchedules || [];
+
+        // Display student badge
+        var studentText = '';
+        if (result.studentName) studentText += result.studentName;
+        if (result.studentId) studentText += (studentText ? ' (' : '') + result.studentId + (studentText ? ')' : '');
+        corStudentBadge.textContent = studentText || filename;
+
+        // Render schedule chips
+        corClassCount.textContent = String(corClassSchedules.length);
+        corChipsList.innerHTML = '';
+        corClassSchedules.forEach(function (c) {
+            var chip = document.createElement('div');
+            chip.className = 'cor-chip';
+            chip.innerHTML = '<strong>' + (c.subjectCode || c.dayCode) + '</strong>: ' + c.days.join('/') + ' ' + c.displayTime;
+            corChipsList.appendChild(chip);
+        });
+
+        // Apply to each day and period in the availability grid
+        var days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        days.forEach(function (day) {
+            corBaseline[day] = {};
+            ['morning', 'afternoon'].forEach(function (period) {
+                var availData = result.availability[day] ? result.availability[day][period] : { free: true, start: (period === 'morning' ? '08:00' : '13:00'), end: (period === 'morning' ? '12:00' : '20:00'), conflicts: [] };
+                var isFree = availData.free;
+
+                var slot = document.querySelector('.availability-slot[data-day="' + day + '"][data-period="' + period + '"]');
+                if (slot) {
+                    var cb = slot.querySelector('input[type="checkbox"]');
+                    var times = slot.querySelectorAll('input[type="time"]');
+
+                    if (times.length >= 2) {
+                        if (availData.start) times[0].value = availData.start;
+                        if (availData.end) times[1].value = availData.end;
+                    }
+
+                    if (cb) {
+                        cb.checked = isFree;
+                    }
+
+                    // Save baseline
+                    corBaseline[day][period] = {
+                        enabled: isFree,
+                        start: times.length >= 2 ? times[0].value : availData.start,
+                        end: times.length >= 2 ? times[1].value : availData.end
+                    };
+
+                    updateSlotConflictBadge(slot);
+                }
+            });
+        });
+
+        corSuccessPanel.style.display = 'block';
+        updatePreview();
+        checkModificationsAgainstBaseline();
+    }
+
+    function checkModificationsAgainstBaseline() {
+        if (!corBaseline) return;
+        var hasDifferences = false;
+
+        var days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        days.forEach(function (day) {
+            ['morning', 'afternoon'].forEach(function (period) {
+                var slot = document.querySelector('.availability-slot[data-day="' + day + '"][data-period="' + period + '"]');
+                if (!slot) return;
+                var cb = slot.querySelector('input[type="checkbox"]');
+                var times = slot.querySelectorAll('input[type="time"]');
+                var base = corBaseline[day] ? corBaseline[day][period] : null;
+
+                if (cb && times.length >= 2 && base) {
+                    var isModified = (cb.checked !== base.enabled) ||
+                                     (times[0].value !== base.start) ||
+                                     (times[1].value !== base.end);
+                    if (isModified) {
+                        hasDifferences = true;
+                        slot.classList.add('availability-slot--modified');
+                    } else {
+                        slot.classList.remove('availability-slot--modified');
+                    }
+                }
+            });
+        });
+
+        if (corAdjustmentNotice) {
+            corAdjustmentNotice.style.display = hasDifferences ? 'flex' : 'none';
+        }
+    }
+
+    // Attach listeners to recalculate conflicts and modifications on time or checkbox change
+    document.querySelectorAll('.availability-slot').forEach(function (slot) {
+        var cb = slot.querySelector('input[type="checkbox"]');
+        var times = slot.querySelectorAll('input[type="time"]');
+
+        if (cb) {
+            cb.addEventListener('change', function () {
+                updateSlotConflictBadge(slot);
+                checkModificationsAgainstBaseline();
+            });
+        }
+
+        times.forEach(function (t) {
+            t.addEventListener('input', function () {
+                updateSlotConflictBadge(slot);
+                checkModificationsAgainstBaseline();
+            });
+            t.addEventListener('change', function () {
+                updateSlotConflictBadge(slot);
+                checkModificationsAgainstBaseline();
+            });
+        });
+    });
+
+}());
 </script>
 
 </body>

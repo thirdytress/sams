@@ -1,155 +1,98 @@
 <?php
-/**
- * Database Connection Manager
- * Uses PDO for secure, prepared statement support
- * Works on both XAMPP and Hostinger
- */
+declare(strict_types=1);
 
-require_once __DIR__ . '/Environment.php';
+function sams_db_config(): array
+{
+    return [
+        'dsn' => getenv('SAMS_DB_DSN') ?: '',
+        'host' => getenv('SAMS_DB_HOST') ?: 'localhost',
+        'port' => getenv('SAMS_DB_PORT') ?: '3306',
 
-class Database {
-    private static ?PDO $connection = null;
-    private static array $options = [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
-        PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
+        // FIXED: your database name in phpMyAdmin is sams_db
+        'name' => getenv('SAMS_DB_NAME') ?: 'sams_db',
+
+        'user' => getenv('SAMS_DB_USER') ?: 'root',
+        'pass' => getenv('SAMS_DB_PASSWORD') ?: '',
+        'charset' => getenv('SAMS_DB_CHARSET') ?: 'utf8mb4',
     ];
+}
 
-    /**
-     * Get database connection (singleton pattern)
-     */
-    public static function connect(): PDO {
-        if (self::$connection !== null) {
-            return self::$connection;
+function sams_pdo(): PDO
+{
+    static $pdo = null;
+
+    if ($pdo instanceof PDO) {
+        return $pdo;
+    }
+
+    $config = sams_db_config();
+    $appEnv = strtolower((string) (getenv('APP_ENV') ?: 'local'));
+
+    if ($appEnv !== 'local' && $appEnv !== 'development') {
+        if (($config['user'] === 'root' || $config['user'] === '') && $config['pass'] === '') {
+            throw new RuntimeException('Refusing insecure DB credentials outside local/development. Set SAMS_DB_USER and SAMS_DB_PASSWORD.');
+        }
+    }
+
+    if ($config['dsn'] !== '') {
+        $dsn = $config['dsn'];
+    } else {
+        $dsn = sprintf(
+            'mysql:host=%s;port=%s;dbname=%s;charset=%s',
+            $config['host'],
+            $config['port'],
+            $config['name'],
+            $config['charset']
+        );
+    }
+
+    try {
+        $pdo = new PDO($dsn, $config['user'], $config['pass'], [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]);
+    } catch (PDOException $exception) {
+        // If localhost fails, try 127.0.0.1 as a local-only fallback.
+        if ($config['dsn'] !== '' || $config['host'] !== 'localhost') {
+            throw new RuntimeException('Unable to connect to the SAMS database: ' . $exception->getMessage());
         }
 
         try {
-            $host = Environment::get('DB_HOST', 'localhost');
-            $port = Environment::get('DB_PORT', '3306');
-            $name = Environment::get('DB_NAME');
-            $user = Environment::get('DB_USER');
-            $pass = Environment::get('DB_PASS', '');
-
-            if (!$name) {
-                throw new Exception("Database name not configured in .env");
-            }
-
-            $dsn = "mysql:host={$host};port={$port};dbname={$name};charset=utf8mb4";
-            
-            self::$connection = new PDO($dsn, $user, $pass, self::$options);
-            
-            return self::$connection;
-        } catch (PDOException $e) {
-            if (Environment::isDebug()) {
-                die('Database Connection Error: ' . $e->getMessage());
-            } else {
-                die('Unable to connect to database. Please contact administrator.');
-            }
+            $dsn2 = sprintf(
+                'mysql:host=127.0.0.1;port=%s;dbname=%s;charset=%s',
+                $config['port'],
+                $config['name'],
+                $config['charset']
+            );
+            $pdo = new PDO($dsn2, $config['user'], $config['pass'], [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+            ]);
+        } catch (PDOException $exception2) {
+            throw new RuntimeException('Unable to connect to the SAMS database: ' . $exception2->getMessage());
         }
     }
 
-    /**
-     * Execute prepared statement safely
-     */
-    public static function prepare(string $sql): PDOStatement {
-        return self::connect()->prepare($sql);
-    }
+    return $pdo;
+}
 
-    /**
-     * Execute query and return results
-     */
-    public static function query(string $sql, array $params = []): array {
-        $stmt = self::prepare($sql);
-        $stmt->execute($params);
-        return $stmt->fetchAll();
-    }
+function sams_setting(string $key, ?string $default = null): ?string
+{
+    try {
+        $statement = sams_pdo()->prepare(
+            'SELECT setting_value FROM system_settings WHERE setting_key = :setting_key LIMIT 1'
+        );
 
-    /**
-     * Execute query and return single row
-     */
-    public static function queryOne(string $sql, array $params = []) {
-        $stmt = self::prepare($sql);
-        $stmt->execute($params);
-        return $stmt->fetch();
-    }
-
-    /**
-     * Insert record
-     */
-    public static function insert(string $table, array $data): int {
-        $columns = implode(',', array_keys($data));
-        $placeholders = implode(',', array_fill(0, count($data), '?'));
-        $sql = "INSERT INTO {$table} ({$columns}) VALUES ({$placeholders})";
-        
-        $stmt = self::prepare($sql);
-        $stmt->execute(array_values($data));
-        
-        return (int) self::connect()->lastInsertId();
-    }
-
-    /**
-     * Update record
-     */
-    public static function update(string $table, array $data, string $where, array $whereParams = []): int {
-        $set = implode(',', array_map(fn($key) => "{$key}=?", array_keys($data)));
-        $sql = "UPDATE {$table} SET {$set} WHERE {$where}";
-        
-        $stmt = self::prepare($sql);
-        $params = array_merge(array_values($data), $whereParams);
-        $stmt->execute($params);
-        
-        return $stmt->rowCount();
-    }
-
-    /**
-     * Delete record
-     */
-    public static function delete(string $table, string $where, array $params = []): int {
-        $sql = "DELETE FROM {$table} WHERE {$where}";
-        $stmt = self::prepare($sql);
-        $stmt->execute($params);
-        return $stmt->rowCount();
-    }
-
-    /**
-     * Execute transaction
-     */
-    public static function beginTransaction(): void {
-        self::connect()->beginTransaction();
-    }
-
-    /**
-     * Commit transaction
-     */
-    public static function commit(): void {
-        self::connect()->commit();
-    }
-
-    /**
-     * Rollback transaction
-     */
-    public static function rollback(): void {
-        self::connect()->rollBack();
-    }
-
-    /**
-     * Check if table exists
-     */
-    public static function tableExists(string $tableName): bool {
-        $sql = "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?";
-        $result = self::queryOne($sql, [
-            Environment::get('DB_NAME'),
-            $tableName
+        $statement->execute([
+            'setting_key' => $key
         ]);
-        return $result !== null;
-    }
 
-    /**
-     * Get table column info
-     */
-    public static function getTableColumns(string $tableName): array {
-        $sql = "SHOW COLUMNS FROM {$tableName}";
-        return self::query($sql);
+        $value = $statement->fetchColumn();
+
+        return $value !== false ? (string) $value : $default;
+    } catch (Throwable $exception) {
+        return $default;
     }
 }

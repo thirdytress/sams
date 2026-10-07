@@ -1,230 +1,420 @@
 <?php
-// application.php – NU SAMS Admin | Application Management
-// Student Assistant Management System | National University – Lipa
+declare(strict_types=1);
 
-session_start();
+require_once __DIR__ . '/../config/bootstrap.php';
+require_once __DIR__ . '/../config/mail.php';
 
-// Require admin login (shared with dashboard)
-if (!isset($_SESSION['admin_id'])) {
-  header('Location: login.php');
+$currentUser = sams_authenticated_user();
+if (!$currentUser || ($currentUser['role'] ?? null) !== 'admin') {
+  header('Location: ../login.php');
+  exit;
+}
+$admin_name = (string) ($currentUser['name'] ?? 'SAMS Admin');
+
+$flashMessage = '';
+$flashError = '';
+$officeOptions = sams_office_options();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $applicationId = (int) ($_POST['application_id'] ?? 0);
+  $reviewAction = trim((string) ($_POST['review_action'] ?? ''));
+
+  if ($applicationId <= 0 || !in_array($reviewAction, ['approve', 'reject'], true)) {
+    $flashError = 'Invalid review request.';
+  } else {
+    try {
+      $pdo = sams_pdo();
+
+      $applicationStatement = $pdo->prepare(
+        'SELECT
+          a.application_id AS application_id,
+          a.status,
+          a.term_id,
+          a.preferred_office,
+          u.email,
+          u.first_name,
+          u.last_name
+        FROM applications a
+        INNER JOIN students s ON s.student_id = a.student_id
+        INNER JOIN users u ON u.user_id = s.user_id
+        WHERE a.application_id = :application_id
+        LIMIT 1'
+      );
+      $applicationStatement->execute(['application_id' => $applicationId]);
+      $application = $applicationStatement->fetch();
+
+      if (!$application) {
+        throw new RuntimeException('Application not found.');
+      }
+
+      $newStatus = $reviewAction === 'approve' ? 'approved' : 'rejected';
+
+      $updateStatement = $pdo->prepare(
+        'UPDATE applications
+         SET status = :status,
+             reviewed_by = :reviewed_by,
+             reviewed_at = NOW()
+         WHERE application_id = :application_id'
+      );
+      $updateStatement->execute([
+        'status' => $newStatus,
+        'reviewed_by' => (int) ($currentUser['user_id'] ?? 0),
+        'application_id' => $applicationId,
+      ]);
+
+      if ($reviewAction === 'approve') {
+        $activateStatement = $pdo->prepare(
+          'UPDATE users u
+           INNER JOIN students s ON s.user_id = u.user_id
+           INNER JOIN applications a ON a.student_id = s.student_id
+           SET u.is_active = 1
+           WHERE a.application_id = :application_id'
+        );
+
+        $activateStatement->execute(['application_id' => $applicationId]);
+
+        // Automatically populate duty_schedules based on student's availability
+        $availStmt = $pdo->prepare(
+            "SELECT day_of_week, start_time AS time_start, end_time AS time_end
+             FROM availability
+             WHERE application_id = :application_id
+               AND term_id = :term_id"
+        );
+        $availStmt->execute([
+            'application_id' => $applicationId,
+            'term_id' => (int) $application['term_id']
+        ]);
+        $availRows = $availStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (!empty($availRows)) {
+            // Delete existing duty schedules before inserting to prevent duplicates
+            $delAppStmt = $pdo->prepare('DELETE FROM duty_schedules WHERE application_id = :application_id');
+            $delAppStmt->execute(['application_id' => $applicationId]);
+
+            $hasOfficeColumn = sams_column_exists($pdo, 'duty_schedules', 'office_name');
+            if ($hasOfficeColumn) {
+                $insertAppStmt = $pdo->prepare(
+                    'INSERT INTO duty_schedules (application_id, office_name, term_id, day_of_week, start_time, end_time, status) 
+                     VALUES (:application_id, :office_name, :term_id, :day_of_week, :time_start, :time_end, "assigned")'
+                );
+            } else {
+                $insertAppStmt = $pdo->prepare(
+                    'INSERT INTO duty_schedules (application_id, term_id, day_of_week, start_time, end_time, status) 
+                     VALUES (:application_id, :term_id, :day_of_week, :time_start, :time_end, "assigned")'
+                );
+            }
+
+            foreach ($availRows as $arow) {
+                $day = trim((string) $arow['day_of_week']);
+                $normalizedDay = match (strtolower($day)) {
+                    'monday', 'mon' => 'Monday',
+                    'tuesday', 'tue' => 'Tuesday',
+                    'wednesday', 'wed' => 'Wednesday',
+                    'thursday', 'thu' => 'Thursday',
+                    'friday', 'fri' => 'Friday',
+                    'saturday', 'sat' => 'Saturday',
+                    default => $day,
+                };
+
+                $insertParams = [
+                    'application_id' => $applicationId,
+                    'term_id' => (int) $application['term_id'],
+                    'day_of_week' => $normalizedDay,
+                    'time_start' => (string) $arow['time_start'],
+                    'time_end' => (string) $arow['time_end'],
+                ];
+
+                if ($hasOfficeColumn) {
+                    $insertParams['office_name'] = $application['preferred_office'];
+                }
+
+                $insertAppStmt->execute($insertParams);
+            }
+        }
+      }
+
+      try {
+        sams_send_application_review_email(
+          (string) ($application['email'] ?? ''),
+          trim((string) ($application['first_name'] ?? '') . ' ' . (string) ($application['last_name'] ?? '')),
+          $newStatus
+        );
+      } catch (Throwable $mailException) {
+        $flashError = 'Application was updated, but the email notification could not be sent: ' . $mailException->getMessage();
+      }
+
+      $flashMessage = $reviewAction === 'approve'
+        ? 'Application approved successfully.'
+        : 'Application rejected successfully.';
+    } catch (Throwable $exception) {
+      $flashError = $exception->getMessage();
+    }
+  }
+
+  if ($flashMessage !== '') {
+    $_SESSION['sams_app_flash'] = $flashMessage;
+  }
+  if ($flashError !== '') {
+    $_SESSION['sams_app_error'] = $flashError;
+  }
+
+  if ($applicationId > 0 && ($_POST['return_to_detail'] ?? '') === '1') {
+    header('Location: application_view.php?application_id=' . $applicationId);
+  } else {
+    header('Location: application.php');
+  }
   exit;
 }
 
-require_once __DIR__ . '/../db.php';
-require_once __DIR__ . '/../vendor/autoload.php';
-require_once __DIR__ . '/../mail_config.php';
+function sams_application_status_label(string $status): string
+{
+  return match ($status) {
+    'pending' => 'Pending',
+    'under_review' => 'Under Review',
+    'interview' => 'Interview',
+    'approved' => 'Approved',
+    'deployed' => 'Deployed',
+    'rejected' => 'Rejected',
+    default => ucfirst(str_replace('_', ' ', $status)),
+  };
+}
 
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
+function sams_application_status_class(string $status): string
+{
+  return match ($status) {
+    'pending' => 'badge--pending',
+    'under_review' => 'badge--interview',
+    'interview' => 'badge--interview',
+    'approved' => 'badge--approved',
+    'deployed' => 'badge--deployed',
+    'rejected' => 'badge--rejected',
+    default => 'badge--pending',
+  };
+}
 
-function send_approval_email(string $toEmail, string $toName, string &$error): bool {
-  $mail = new PHPMailer(true);
+function sams_application_avatar(string $name): string
+{
+  $parts = preg_split('/\s+/', trim($name)) ?: [];
+  $initials = '';
 
-  try {
-    $smtpPassword = (string) MAIL_PASSWORD;
-    if (stripos((string) MAIL_HOST, 'gmail.com') !== false) {
-      $smtpPassword = str_replace(' ', '', $smtpPassword);
+  foreach ($parts as $part) {
+    if ($part === '') {
+      continue;
     }
 
-    $mail->isSMTP();
-    $mail->Host       = MAIL_HOST;
-    $mail->SMTPAuth   = true;
-    $mail->Username   = MAIL_USERNAME;
-    $mail->Password   = $smtpPassword;
-    $mail->Port       = MAIL_PORT;
-    $mail->SMTPSecure = MAIL_ENCRYPTION;
+    $initials .= strtoupper(substr($part, 0, 1));
 
-    $mail->setFrom(MAIL_FROM_EMAIL, MAIL_FROM_NAME);
-    $mail->addAddress($toEmail, $toName !== '' ? $toName : $toEmail);
+    if (strlen($initials) >= 2) {
+      break;
+    }
+  }
 
-    $safeName = htmlspecialchars($toName !== '' ? $toName : 'Student');
-    $mail->isHTML(true);
-    $mail->Subject = 'Congratulations! Your NU SAMS application is approved';
-    $mail->Body = '<div style="margin:0;padding:24px;background:#f3f7ff;font-family:Inter,Segoe UI,Arial,sans-serif;color:#111827;">'
-      . '<table role="presentation" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #dbeafe;">'
-      . '<tr><td style="background:linear-gradient(135deg,#003087 0%,#0047ab 100%);padding:24px;text-align:center;color:#ffffff;">'
-      . '<div style="width:64px;height:64px;border-radius:12px;background:#ffffff;color:#003087;font-size:30px;line-height:64px;text-align:center;font-weight:900;margin:0 auto 12px auto;">NU</div>'
-      . '<div style="font-size:22px;font-weight:800;letter-spacing:.3px;">Welcome to NU SAMS</div>'
-      . '<div style="font-size:13px;opacity:.9;margin-top:6px;">National University - Lipa</div>'
-      . '</td></tr>'
-      . '<tr><td style="padding:24px;">'
-      . '<p style="margin:0 0 12px 0;font-size:15px;">Hello <strong>' . $safeName . '</strong>,</p>'
-      . '<p style="margin:0 0 12px 0;font-size:14px;line-height:1.6;color:#334155;">Congratulations! Your Student Assistant application has been <strong>approved</strong>.</p>'
-      . '<p style="margin:0 0 12px 0;font-size:14px;line-height:1.6;color:#334155;">Welcome to the NU SAMS family. You can now access your student dashboard and begin your journey with us.</p>'
-      . '<p style="margin:0;font-size:13px;color:#64748b;">If you have questions, please contact the SDAO office.</p>'
-      . '</td></tr>'
-      . '</table>'
-      . '</div>';
+  return $initials !== '' ? substr($initials, 0, 2) : 'SA';
+}
 
-    $mail->AltBody = 'Congratulations! Your Student Assistant application has been approved. Welcome to the NU SAMS family. You can now access your student dashboard.';
-    $mail->send();
-    return true;
-  } catch (Exception $ex) {
-    $error = 'Mailer error: ' . $mail->ErrorInfo;
-    return false;
+function sams_application_skill_tags(?string $skills): array
+{
+  if ($skills === null || trim($skills) === '') {
+    return [];
+  }
+
+  $items = preg_split('/[\r\n,;]+/', $skills) ?: [];
+
+  return array_values(array_filter(array_map('trim', $items), static fn (string $item): bool => $item !== ''));
+}
+
+$pdo = sams_pdo();
+$courseOptions = sams_course_options();
+
+$applicationCounts = [
+  'all' => 0,
+  'pending' => 0,
+  'rejected' => 0,
+];
+
+$applicationCountsStatement = $pdo->query(
+  "SELECT
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM duty_schedules ds
+        WHERE ds.application_id = a.application_id
+          AND ds.status = 'deployed'
+      ) THEN 'deployed'
+      ELSE a.status
+    END AS display_status,
+    COUNT(*) AS total
+   FROM applications a
+     WHERE a.status NOT IN ('draft', 'approved')
+       AND NOT EXISTS (
+         SELECT 1
+         FROM duty_schedules ds
+         WHERE ds.application_id = a.application_id
+           AND ds.status = 'deployed'
+       )
+   GROUP BY display_status"
+);
+foreach ($applicationCountsStatement->fetchAll(PDO::FETCH_ASSOC) as $countRow) {
+  $status = (string) $countRow['display_status'];
+  $count = (int) $countRow['total'];
+    $applicationCounts['all'] += $count;
+  if (array_key_exists($status, $applicationCounts)) {
+    $applicationCounts[$status] = $count;
   }
 }
 
-// Ensure approval status column exists for gating login/access.
-$has_status_column = false;
-if ($colRes = $mysqli->query("SHOW COLUMNS FROM student_applications LIKE 'application_status'")) {
-  $has_status_column = $colRes->num_rows > 0;
-  $colRes->free();
-}
+$applicationsStatement = $pdo->query(
+  "SELECT
+    a.application_id AS application_id,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM duty_schedules ds
+        WHERE ds.application_id = a.application_id
+          AND ds.status = 'deployed'
+      ) THEN 'deployed'
+      ELSE a.status
+    END AS status,
+    a.preferred_office,
+    a.skills,
+    a.submitted_at,
+    a.reviewed_at,
+    a.reviewed_by,
+    u.first_name,
+    u.last_name,
+    u.email,
+    s.student_id_number AS student_id_number,
+    s.program,
+    s.year_level,
+    t.term_name,
+    t.term_year AS school_year,
+    (SELECT COALESCE(SUM(TIMESTAMPDIFF(MINUTE, start_time, end_time)), 0) / 60 FROM availability WHERE application_id = a.application_id) AS total_available_hours
+  FROM applications a
+  INNER JOIN students s ON s.student_id = a.student_id
+  INNER JOIN users u ON u.user_id = s.user_id
+  INNER JOIN terms t ON t.term_id = a.term_id
+  WHERE a.status NOT IN ('draft', 'approved')
+    AND NOT EXISTS (
+      SELECT 1
+      FROM duty_schedules ds
+      WHERE ds.application_id = a.application_id
+        AND ds.status = 'deployed'
+    )
+  ORDER BY a.submitted_at DESC, a.application_id DESC"
+);
 
-if (!$has_status_column) {
-  $mysqli->query("ALTER TABLE student_applications ADD COLUMN application_status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending'");
-  if ($colRes = $mysqli->query("SHOW COLUMNS FROM student_applications LIKE 'application_status'")) {
-    $has_status_column = $colRes->num_rows > 0;
-    $colRes->free();
-  }
-}
+$applications = $applicationsStatement->fetchAll();
 
-$flash_message = '';
-$flash_type = 'success';
+// --- RECOMMENDATION LOGIC ---
+$selectedSkills = isset($_GET['filter_skills']) ? array_filter(array_map('trim', explode(',', (string)$_GET['filter_skills']))) : [];
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-  $action = strtolower(trim((string) ($_POST['action'] ?? '')));
-  $student_id = trim((string) ($_POST['student_id'] ?? ''));
-
-  if ($has_status_column && $student_id !== '' && in_array($action, ['approve', 'reject'], true)) {
-    $student_email = '';
-    $student_name_for_email = '';
-    $sel = $mysqli->prepare('SELECT full_name, email FROM student_applications WHERE student_id = ? ORDER BY created_at DESC LIMIT 1');
-    if ($sel) {
-      $sel->bind_param('s', $student_id);
-      $sel->execute();
-      $resSel = $sel->get_result();
-      if ($rowSel = $resSel->fetch_assoc()) {
-        $student_name_for_email = (string) ($rowSel['full_name'] ?? '');
-        $student_email = (string) ($rowSel['email'] ?? '');
-      }
-      $resSel && $resSel->free();
-      $sel->close();
-    }
-
-    $new_status = $action === 'approve' ? 'approved' : 'rejected';
-    $upd = $mysqli->prepare('UPDATE student_applications SET application_status = ? WHERE student_id = ? ORDER BY created_at DESC LIMIT 1');
-    if ($upd) {
-      $upd->bind_param('ss', $new_status, $student_id);
-      if ($upd->execute()) {
-        $flash_message = $new_status === 'approved' ? 'Applicant approved successfully.' : 'Applicant rejected successfully.';
-
-        if ($new_status === 'approved' && $student_email !== '') {
-          $mail_error = '';
-          if (send_approval_email($student_email, $student_name_for_email, $mail_error)) {
-            $flash_message .= ' Approval email was sent to the student.';
-          } else {
-            $flash_message .= ' Applicant was approved, but the email could not be sent (' . $mail_error . ').';
-          }
+// If skills are filtered, filter the original application list to only show applicants with matching skills
+if (!empty($selectedSkills)) {
+    $filteredApps = [];
+    foreach ($applications as $app) {
+        $appSkills = sams_application_skill_tags($app['skills'] ?? null);
+        $matches = array_intersect($appSkills, $selectedSkills);
+        if (count($matches) > 0) {
+            $filteredApps[] = $app;
         }
-      } else {
-        $flash_message = 'Failed to update application status.';
-        $flash_type = 'error';
-      }
-      $upd->close();
-    } else {
-      $flash_message = 'Database error while updating status.';
-      $flash_type = 'error';
     }
-  }
+    $applications = $filteredApps;
 }
 
-// Load all applications (most recent first)
-$applications = [];
-$select_status_sql = $has_status_column ? ', application_status' : '';
-if ($result = $mysqli->query("SELECT full_name, student_id, email, contact_number, course, year_level, work_location, skills, created_at{$select_status_sql} FROM student_applications ORDER BY created_at DESC")) {
-  while ($row = $result->fetch_assoc()) {
-    $applications[] = $row;
-  }
-  $result->free();
-}
-
-$total_all = count($applications);
-$total_pending   = 0;
-$total_interview = 0;
-$total_approved  = 0;
-$total_rejected  = 0;
-
+$recommendedIds = [];
+$eligibleApps = [];
 foreach ($applications as $app) {
-  $st = strtolower(trim((string) ($app['application_status'] ?? 'pending')));
-  if ($st === 'approved') {
-    $total_approved++;
-  } elseif ($st === 'rejected') {
-    $total_rejected++;
-  } else {
-    $total_pending++;
-  }
-}
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Application Management – SA System</title>
-  <meta name="description" content="Admin Application Management for NU Lipa Student Assistant System." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet" />
-  <style>
-    /* =============================================
-       CSS VARIABLES / DESIGN TOKENS
-    ============================================= */
-    :root {
-      --color-blue:           #155dfc;
-      --color-blue-dark:      #1447e6;
-      --color-purple:         #9810fa;
-      --color-purple-dark:    #8200db;
-      --color-dark:           #101828;
-      --color-body:           #364153;
-      --color-muted:          #4a5565;
-      --color-muted-light:    #99a1af;
-      --color-white:          #ffffff;
-      --color-bg:             #f9fafb;
-      --color-border:         #e5e7eb;
-      --color-input-border:   #d1d5dc;
-      --color-tag-bg:         #f3f4f6;
-      --color-red-dot:        #fb2c36;
-
-      /* Status badge colours */
-      --color-pending-bg:     #fef9c2;
-      --color-pending-text:   #a65f00;
-      --color-interview-bg:   #dbeafe;
-      --color-interview-text: #1447e6;
-      --color-approved-bg:    #dcfce7;
-      --color-approved-text:  #008236;
-      --color-rejected-bg:    #fee2e2;
-      --color-rejected-text:  #b91c1c;
-
-      --grad-brand:    linear-gradient(135deg, #155dfc 0%, #9810fa 100%);
-      --grad-blue:     linear-gradient(158deg, #155dfc 0%, #1447e6 100%);
-      --grad-purple:   linear-gradient(158deg, #9810fa 0%, #8200db 100%);
-
-      --shadow-card:   0 1px 3px 0 rgba(0,0,0,.10), 0 1px 2px 0 rgba(0,0,0,.06);
-
-      --sidebar-w:     256px;
-      --topbar-h:      89px;
-
-      --radius-sm:     4px;
-      --radius-md:     10px;
-      --radius-lg:     16px;
-      --radius-pill:   9999px;
-
-      --font-xs:   12px;
-      --font-sm:   14px;
-      --font-base: 16px;
-      --font-lg:   18px;
-      --font-xl:   24px;
-
-      --space-1:   4px;
-      --space-2:   8px;
-      --space-3:   12px;
-      --space-4:   16px;
-      --space-5:   20px;
-      --space-6:   24px;
-      --space-8:   32px;
+    if ($app['status'] === 'pending') {
+        $eligibleApps[] = $app;
     }
+}
+
+if (!empty($selectedSkills)) {
+    usort($eligibleApps, function($a, $b) use ($selectedSkills) {
+        $skillsA = sams_application_skill_tags($a['skills'] ?? null);
+        $skillsB = sams_application_skill_tags($b['skills'] ?? null);
+        $matchA = count(array_intersect($skillsA, $selectedSkills));
+        $matchB = count(array_intersect($skillsB, $selectedSkills));
+        
+        if ($matchA !== $matchB) {
+            return $matchB <=> $matchA; // higher skill match count first
+        }
+        
+        $hoursA = (float)($a['total_available_hours'] ?? 0);
+        $hoursB = (float)($b['total_available_hours'] ?? 0);
+        return $hoursB <=> $hoursA; // then higher available hours
+    });
+} else {
+    usort($eligibleApps, function($a, $b) {
+        $hoursA = (float)($a['total_available_hours'] ?? 0);
+        $hoursB = (float)($b['total_available_hours'] ?? 0);
+        return $hoursB <=> $hoursA;
+    });
+}
+
+$top5 = array_slice($eligibleApps, 0, 5);
+foreach ($top5 as $app) {
+    $recommendedIds[$app['application_id']] = true;
+}
+
+$recommendedAppsList = [];
+$otherAppsList = [];
+foreach ($applications as $app) {
+    if (isset($recommendedIds[$app['application_id']])) {
+        $app['is_recommended'] = true;
+        $recommendedAppsList[] = $app;
+    } else {
+        $app['is_recommended'] = false;
+        $otherAppsList[] = $app;
+    }
+}
+
+if (!empty($selectedSkills)) {
+    usort($recommendedAppsList, function($a, $b) use ($selectedSkills) {
+        $skillsA = sams_application_skill_tags($a['skills'] ?? null);
+        $skillsB = sams_application_skill_tags($b['skills'] ?? null);
+        $matchA = count(array_intersect($skillsA, $selectedSkills));
+        $matchB = count(array_intersect($skillsB, $selectedSkills));
+        
+        if ($matchA !== $matchB) {
+            return $matchB <=> $matchA;
+        }
+        
+        $hoursA = (float)($a['total_available_hours'] ?? 0);
+        $hoursB = (float)($b['total_available_hours'] ?? 0);
+        return $hoursB <=> $hoursA;
+    });
+} else {
+    usort($recommendedAppsList, function($a, $b) {
+        $hoursA = (float)($a['total_available_hours'] ?? 0);
+        $hoursB = (float)($b['total_available_hours'] ?? 0);
+        return $hoursB <=> $hoursA;
+    });
+}
+
+$applications = array_merge($recommendedAppsList, $otherAppsList);
+// ----------------------------
+
+if ($flashMessage === '' && isset($_SESSION['sams_app_flash'])) {
+  $flashMessage = (string) $_SESSION['sams_app_flash'];
+  unset($_SESSION['sams_app_flash']);
+}
+
+if ($flashError === '' && isset($_SESSION['sams_app_error'])) {
+  $flashError = (string) $_SESSION['sams_app_error'];
+  unset($_SESSION['sams_app_error']);
+}
+
+$statusFilterOptions = [
+  'all' => 'All',
+  'pending' => 'Pending',
+  'rejected' => 'Rejected',
+];
+
+$activeAdminNav = 'applications';
+$pendingApplications = (int) $applicationCounts['pending'];
+?>
+<style>
 
     /* =============================================
        RESET & BASE
@@ -243,331 +433,165 @@ foreach ($applications as $app) {
     button, input { font-family: inherit; }
 
     /* =============================================
-       APP SHELL
-    ============================================= */
-    .app {
-      display: flex;
-      height: 100vh;
-      overflow: hidden;
-    }
-
-    /* =============================================
-       SIDEBAR
-    ============================================= */
-    .sidebar {
-      width: var(--sidebar-w);
-      flex-shrink: 0;
-      background: var(--color-white);
-      border-right: 1px solid var(--color-border);
-      display: flex;
-      flex-direction: column;
-      height: 100%;
-      overflow: hidden;
-    }
-
-    /* Sidebar brand */
-    .sidebar__brand {
-      height: var(--topbar-h);
-      border-bottom: 1px solid var(--color-border);
-      padding: var(--space-6) var(--space-6) 0;
-      display: flex;
-      align-items: center;
-      gap: var(--space-3);
-      flex-shrink: 0;
-    }
-    .sidebar__logo {
-      width: 40px;
-      height: 40px;
-      border-radius: var(--radius-md);
-      background: var(--grad-brand);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: var(--font-lg);
-      font-weight: 700;
-      color: var(--color-white);
-      flex-shrink: 0;
-    }
-    .sidebar__brand-name {
-      font-size: var(--font-base);
-      font-weight: 700;
-      color: var(--color-dark);
-    }
-    .sidebar__brand-sub {
-      font-size: var(--font-xs);
-      color: var(--color-muted);
-    }
-
-    /* Nav */
-    .sidebar__nav {
-      flex: 1;
-      overflow-y: auto;
-      padding: var(--space-4) var(--space-4) 0;
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-1);
-    }
-    .nav-item {
-      display: flex;
-      align-items: center;
-      gap: var(--space-3);
-      height: 48px;
-      padding: 0 var(--space-4);
-      border-radius: var(--radius-md);
-      font-size: var(--font-base);
-      color: var(--color-body);
-      cursor: pointer;
-      transition: background .15s;
-    }
-    .nav-item:hover { background: var(--color-bg); }
-    .nav-item--active {
-      background: var(--color-blue);
-      color: var(--color-white);
-    }
-    .nav-item--active:hover { background: var(--color-blue); }
-    .nav-item__icon { width: 20px; height: 20px; flex-shrink: 0; }
-    .nav-item__label { flex: 1; }
-    .nav-item__badge {
-      background: var(--color-white);
-      color: var(--color-blue);
-      font-size: var(--font-xs);
-      font-weight: 700;
-      padding: 2px var(--space-2);
-      border-radius: var(--radius-pill);
-      min-width: 20px;
-      text-align: center;
-    }
-
-    /* Sidebar footer */
-    .sidebar__footer {
-      border-top: 1px solid var(--color-border);
-      padding: 17px var(--space-4) var(--space-4);
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-1);
-      flex-shrink: 0;
-    }
-
-    /* Mobile sidebar toggle */
-    .sidebar-toggle {
-      display: none;
-      position: fixed;
-      top: 16px;
-      left: 16px;
-      z-index: 200;
-      width: 36px;
-      height: 36px;
-      background: var(--color-white);
-      border: 1px solid var(--color-border);
-      border-radius: var(--radius-md);
-      cursor: pointer;
-      align-items: center;
-      justify-content: center;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .sidebar-toggle__bar {
-      display: block;
-      width: 18px;
-      height: 2px;
-      background: var(--color-dark);
-      border-radius: 2px;
-      transition: transform .3s, opacity .3s;
-    }
-
-    /* =============================================
-       MAIN AREA
-    ============================================= */
-    .main {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-
-    /* Top bar */
-    .topbar {
-      height: var(--topbar-h);
-      flex-shrink: 0;
-      background: var(--color-white);
-      border-bottom: 1px solid var(--color-border);
-      padding: 0 var(--space-8);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .topbar__title {
-      font-size: var(--font-xl);
-      font-weight: 700;
-      color: var(--color-dark);
-      line-height: 1.33;
-    }
-    .topbar__sub {
-      font-size: var(--font-sm);
-      color: var(--color-muted);
-    }
-    .topbar__user {
-      display: flex;
-      align-items: center;
-      gap: var(--space-3);
-    }
-    .topbar__notif {
-      position: relative;
-      width: 36px;
-      height: 36px;
-      border-radius: var(--radius-pill);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-    }
-    .topbar__notif-icon { width: 20px; height: 20px; }
-    .topbar__notif-dot {
-      position: absolute;
-      top: 4px;
-      right: 0;
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--color-red-dot);
-    }
-    .topbar__user-info { text-align: right; }
-    .topbar__user-name {
-      font-size: var(--font-sm);
-      color: var(--color-dark);
-    }
-    .topbar__user-role {
-      font-size: var(--font-xs);
-      color: var(--color-muted);
-    }
-    .topbar__avatar {
-      width: 40px;
-      height: 40px;
-      border-radius: var(--radius-pill);
-      background: var(--grad-brand);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-    }
-    .topbar__avatar-text {
-      font-size: var(--font-sm);
-      font-weight: 700;
-      color: var(--color-white);
-      line-height: 1;
-    }
-
-    /* =============================================
-       PAGE CONTENT
-    ============================================= */
-    .content {
-      flex: 1;
-      overflow-y: auto;
-      padding: var(--space-8);
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-6);
-    }
-
-    /* =============================================
        TOOLBAR (search + filters + export)
     ============================================= */
     .toolbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: var(--space-4);
+      gap: 16px;
       flex-wrap: wrap;
+      user-select: none;
+      -webkit-user-select: none;
+      margin-bottom: 28px;
+      padding: 0;
     }
     .toolbar__left {
       display: flex;
       align-items: center;
-      gap: var(--space-2);
+      gap: 12px;
       flex-wrap: wrap;
+      flex: 1;
+      min-width: 0;
+    }
+    .program-filter-select {
+      height: 38px;
+      min-width: 220px;
+      max-width: 280px;
+      padding: 0 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #fff;
+      color: #1f2937;
+      font: inherit;
+      font-size: 14px;
     }
     .toolbar__search {
       position: relative;
+      flex: 0 1 340px;
+      min-width: 280px;
     }
     .toolbar__search-icon {
       position: absolute;
-      left: 12px;
+      left: 14px;
       top: 50%;
       transform: translateY(-50%);
-      width: 20px;
-      height: 20px;
+      width: 18px;
+      height: 18px;
       pointer-events: none;
+      color: #9ca3af;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     .toolbar__search input {
-      width: 320px;
-      height: 42px;
-      border: 1px solid var(--color-input-border);
-      border-radius: var(--radius-md);
-      padding: var(--space-2) var(--space-4) var(--space-2) 40px;
-      font-size: var(--font-base);
-      color: var(--color-dark);
-      background: var(--color-white);
+      width: 100%;
+      height: 40px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 10px 14px 10px 44px;
+      font-size: 14px;
+      color: #1f2937;
+      background: #ffffff;
       outline: none;
-      transition: border-color .2s;
+      transition: all 0.2s ease;
+      font-weight: 500;
     }
-    .toolbar__search input::placeholder { color: rgba(10,10,10,.5); }
-    .toolbar__search input:focus { border-color: var(--color-blue); }
+    .toolbar__search input::placeholder { 
+      color: #9ca3af;
+      font-weight: 400;
+    }
+    .toolbar__search input:focus { 
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
 
     /* Filter buttons */
     .filter-btn {
-      height: 40px;
-      border-radius: var(--radius-md);
-      border: none;
+      height: 38px;
+      border-radius: 8px;
+      border: 1px solid transparent;
       cursor: pointer;
-      font-size: var(--font-base);
-      padding: 0 16px;
+      font-size: 14px;
+      font-weight: 500;
+      padding: 0 14px;
       display: inline-flex;
       align-items: center;
-      gap: 4px;
-      transition: opacity .15s;
+      gap: 6px;
+      transition: all 0.15s ease;
+      white-space: nowrap;
     }
     .filter-btn--active {
-      background: var(--color-blue);
-      color: var(--color-white);
+      background: #3b82f6;
+      color: #ffffff;
+      border-color: #3b82f6;
+    }
+    .filter-btn--active:hover {
+      background: #2563eb;
+      border-color: #2563eb;
     }
     .filter-btn--inactive {
-      background: var(--color-tag-bg);
-      color: var(--color-body);
+      background: #f3f4f6;
+      color: #4b5563;
+      border-color: #e5e7eb;
     }
-    .filter-btn__count { opacity: .6; }
-    .filter-btn--active .filter-btn__count { opacity: .8; }
+    .filter-btn--inactive:hover {
+      background: #e5e7eb;
+      border-color: #d1d5db;
+    }
+    .filter-btn__count { 
+      opacity: 0.7;
+      font-size: 13px;
+    }
+    .filter-btn--active .filter-btn__count { opacity: 0.85; }
 
     /* Export button */
     .btn-export {
       display: inline-flex;
       align-items: center;
-      gap: var(--space-2);
-      height: 40px;
-      padding: 0 var(--space-4);
-      border-radius: var(--radius-md);
+      justify-content: center;
+      gap: 8px;
+      height: 38px;
+      padding: 0 16px;
+      border-radius: 8px;
       border: none;
-      background: var(--color-blue);
-      color: var(--color-white);
-      font-size: var(--font-base);
+      background: #3b82f6;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 500;
       cursor: pointer;
       white-space: nowrap;
-      transition: opacity .15s;
+      transition: all 0.2s ease;
       text-decoration: none;
     }
-    .btn-export:hover { opacity: .88; }
+    .btn-export:hover { 
+      background: #2563eb;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
     .btn-export__icon { width: 16px; height: 16px; }
 
     /* =============================================
        TABLE CARD
     ============================================= */
     .table-card {
-      background: var(--color-white);
-      border: 1px solid var(--color-border);
-      border-radius: var(--radius-lg);
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      margin-bottom: 32px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
     }
     .table-wrap {
       overflow-x: auto;
+      overflow-y: auto;
       -webkit-overflow-scrolling: touch;
+      max-height: min(72vh, 860px);
+      min-height: 0;
     }
     table {
       width: 100%;
@@ -575,86 +599,155 @@ foreach ($applications as $app) {
       min-width: 900px;
     }
     thead {
-      background: var(--color-bg);
-      border-bottom: 1px solid var(--color-border);
+      background: #f9fafb;
+      border-bottom: 1px solid #e5e7eb;
+      position: sticky;
+      top: 0;
+      z-index: 10;
     }
     th {
-      padding: 16px var(--space-6);
-      font-size: var(--font-sm);
-      font-weight: 700;
-      color: var(--color-dark);
+      padding: 14px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
       text-align: left;
       white-space: nowrap;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
     }
     tbody tr {
-      border-bottom: 1px solid var(--color-border);
+      border-bottom: 1px solid #f3f4f6;
+      transition: background-color 0.15s ease;
     }
     tbody tr:last-child { border-bottom: none; }
-    tbody tr:hover { background: #fafafa; }
+    tbody tr:hover { background: #fafbfc; }
     td {
-      padding: 0 var(--space-6);
-      height: 77px;
+      padding: 14px 16px;
       vertical-align: middle;
-      font-size: var(--font-base);
-      color: var(--color-dark);
+      font-size: 14px;
+      color: #1f2937;
     }
 
     /* Applicant cell */
     .applicant {
       display: flex;
       align-items: center;
-      gap: var(--space-3);
+      gap: 12px;
     }
     .applicant__avatar {
       width: 40px;
       height: 40px;
-      border-radius: var(--radius-pill);
-      background: var(--grad-brand);
+      border-radius: 50%;
+      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: var(--font-sm);
+      font-size: 13px;
       font-weight: 700;
-      color: var(--color-white);
+      color: #ffffff;
       flex-shrink: 0;
+      box-shadow: 0 2px 4px rgba(59, 130, 246, 0.2);
     }
     .applicant__name {
-      font-weight: 700;
-      color: var(--color-dark);
-      line-height: 1.5;
+      font-weight: 600;
+      color: #1f2937;
+      line-height: 1.4;
     }
     .applicant__date {
-      font-size: var(--font-sm);
-      color: var(--color-muted);
+      font-size: 13px;
+      color: #9ca3af;
+      font-weight: 400;
     }
 
     /* Skills tags */
     .skills {
       display: flex;
-      gap: var(--space-1);
+      gap: 6px;
       flex-wrap: wrap;
     }
     .skill-tag {
-      background: var(--color-tag-bg);
-      color: var(--color-body);
-      font-size: var(--font-xs);
-      padding: var(--space-1) var(--space-2);
-      border-radius: var(--radius-sm);
+      background: #ece8ff;
+      color: #6d28d9;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 6px;
       white-space: nowrap;
+      font-weight: 500;
     }
 
     /* Status badges */
     .badge {
       display: inline-block;
-      font-size: var(--font-xs);
-      padding: var(--space-1) var(--space-3);
-      border-radius: var(--radius-pill);
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 20px;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .badge--pending   { background: #fef3c7; color: #92400e; }
+    .badge--interview { background: #bfdbfe; color: #1e40af; }
+    .badge--approved  { background: #d1fae5; color: #065f46; }
+    .badge--deployed  { background: #dbeafe; color: #1d4ed8; }
+    .badge--rejected  { background: #fee2e2; color: #991b1b; }
+    .badge--recommended { background: #fef08a; color: #854d0e; margin-left: 8px; border: 1px solid #fde047; }
+    .tr-recommended { background-color: #fefce8 !important; }
+    .tr-recommended:hover { background-color: #fef9c3 !important; }
+
+    /* Page content styling */
+    .page.content {
+      user-select: none;
+      -webkit-user-select: none;
+      padding: 32px;
+      max-width: 1600px;
+      margin: 0 auto;
+    }
+
+    .page.content input,
+    .page.content textarea,
+    .page.content select {
+      user-select: text;
+      -webkit-user-select: text;
+    }
+
+    .page.content ::selection {
+      background: transparent;
+      color: inherit;
+    }
+
+    .page.content ::-moz-selection {
+      background: transparent;
+      color: inherit;
+    }
+
+    /* Top bar */
+    .topbar__user {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      flex-shrink: 0;
       white-space: nowrap;
     }
-    .badge--pending   { background: var(--color-pending-bg);   color: var(--color-pending-text);   }
-    .badge--interview { background: var(--color-interview-bg); color: var(--color-interview-text); }
-    .badge--approved  { background: var(--color-approved-bg);  color: var(--color-approved-text);  }
-    .badge--rejected  { background: var(--color-rejected-bg);  color: var(--color-rejected-text);  }
+    .topbar__user-info {
+      text-align: right;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .topbar__user-name,
+    .topbar__user-role {
+      white-space: nowrap;
+      line-height: 1.15;
+    }
+    .topbar__user-name {
+      font-size: var(--font-sm);
+      font-weight: 700;
+    }
+    .topbar__user-role {
+      font-size: var(--font-xs);
+      color: var(--color-muted);
+    }
+    .topbar__avatar {
+      flex-shrink: 0;
+    }
 
     /* Action buttons */
     .actions {
@@ -679,9 +772,232 @@ foreach ($applications as $app) {
     .action-btn:hover { background: var(--color-tag-bg); }
     .action-btn svg { width: 16px; height: 16px; }
     .action-btn--view  svg { color: var(--color-muted); }
+    .action-btn--view-text {
+      width: auto;
+      min-width: 64px;
+      height: 36px;
+      padding: 0 12px;
+      border: 1px solid var(--color-border);
+      background: #ffffff;
+      color: var(--color-primary);
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .action-btn--view-text:hover { background: #eff6ff; }
     .action-btn--approve svg { color: #008236; }
     .action-btn--reject  svg { color: #b91c1c; }
     .action-btn--msg   svg { color: var(--color-blue); }
+    .action-form {
+      display: inline-flex;
+      margin: 0;
+    }
+
+    /* =============================================
+       MODAL
+    ============================================= */
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(15, 23, 42, 0.55);
+      z-index: 500;
+    }
+    .modal.is-open {
+      display: flex;
+    }
+    .modal__panel {
+      width: min(760px, 100%);
+      max-height: 85vh;
+      overflow-y: auto;
+      background: var(--color-white);
+      border-radius: 20px;
+      box-shadow: 0 24px 64px rgba(15, 23, 42, 0.28);
+      border: 1px solid var(--color-border);
+    }
+    .modal__header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 28px 28px 20px;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    .modal__title {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 900;
+      color: var(--color-dark);
+      letter-spacing: -0.01em;
+    }
+    .modal__subtitle {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--color-muted);
+      font-weight: 500;
+      line-height: 1.5;
+    }
+    .modal__close {
+      width: 40px;
+      height: 40px;
+      border-radius: 9999px;
+      border: 1px solid #e5e7eb;
+      background: #f9fafb;
+      cursor: pointer;
+      font-size: 24px;
+      line-height: 1;
+      color: #9ca3af;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+    .modal__close:hover {
+      background: #f3f4f6;
+      border-color: #d1d5dc;
+      color: #6b7280;
+    }
+    .modal__body {
+      padding: 28px;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      width: 100%;
+    }
+    .detail-item {
+      background: linear-gradient(180deg, #ffffff 0%, #fbfdfe 100%);
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 16px 18px;
+      word-break: break-word;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.02);
+      transition: all 0.15s ease;
+    }
+    .detail-item:hover {
+      border-color: #d1d5dc;
+      box-shadow: 0 2px 4px rgba(16, 24, 40, 0.04);
+    }
+    .detail-item[style*="grid-column"] {
+      grid-column: 1 / -1;
+    }
+    .detail-item__label {
+      display: block;
+      font-size: 10px;
+      font-weight: 800;
+      color: #9ca3af;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .detail-item__value {
+      font-size: 15px;
+      color: var(--color-dark);
+      line-height: 1.5;
+      word-break: break-word;
+      font-weight: 600;
+    }
+    .modal__skills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .modal__skills .skill-badge {
+      display: inline-flex;
+      align-items: center;
+      background: #dbeafe;
+      color: #1e40af;
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid #93c5fd;
+    }
+    .modal__skills:empty::before {
+      content: '—';
+      color: #d1d5dc;
+    }
+    .modal__footer {
+      display: flex;
+      gap: 12px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      padding: 20px 24px 24px;
+      border-top: 1px solid #f3f4f6;
+      margin-top: 4px;
+    }
+    .modal__action {
+      display: inline-flex;
+      margin: 0;
+    }
+    .modal__button {
+      border: 1px solid transparent;
+      border-radius: 10px;
+      padding: 11px 18px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+      letter-spacing: 0.01em;
+    }
+    .modal__button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 2px 6px rgba(16, 24, 40, 0.08);
+    }
+    .modal__button--approve {
+      background: #10b981;
+      color: #ffffff;
+      border-color: #10b981;
+    }
+    .modal__button--approve:hover {
+      background: #059669;
+      border-color: #059669;
+    }
+    .modal__button--reject {
+      background: #ef4444;
+      color: #ffffff;
+      border-color: #ef4444;
+    }
+    .modal__button--reject:hover {
+      background: #dc2626;
+      border-color: #dc2626;
+    }
+    .modal__button--ghost {
+      background: #f3f4f6;
+      color: #374151;
+      border-color: #d1d5dc;
+    }
+    .modal__button--ghost:hover {
+      background: #e5e7eb;
+      border-color: #b3b7bc;
+    }
+
+    /* =============================================
+       PAGE ALERTS
+    ============================================= */
+    .page-alert {
+      margin-bottom: 16px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .page-alert--success {
+      background: #f0fdf4;
+      color: #166534;
+      border: 1px solid #bbf7d0;
+    }
+    .page-alert--error {
+      background: #fef2f2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+    }
 
     /* =============================================
        BOTTOM INFO CARDS (2-col grid)
@@ -689,149 +1005,229 @@ foreach ($applications as $app) {
     .info-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: var(--space-6);
+      gap: 24px;
+      align-items: stretch;
+      user-select: none;
+      -webkit-user-select: none;
     }
 
-    /* Auto-filtering card */
+    /* Auto-Filtering card */
     .card-auto {
-      background: var(--grad-blue);
-      border-radius: var(--radius-lg);
-      padding: var(--space-6);
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 24px;
       display: flex;
       flex-direction: column;
-      gap: var(--space-2);
+      gap: 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+      min-height: 200px;
+      user-select: none;
+      -webkit-user-select: none;
+      transition: all 0.15s ease;
+    }
+    .card-auto:hover {
+      border-color: #d1d5db;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
     }
     .card-auto__title {
-      font-size: var(--font-lg);
+      font-size: 16px;
       font-weight: 700;
-      color: var(--color-white);
+      color: #1f2937;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
     }
     .card-auto__desc {
-      font-size: var(--font-sm);
-      color: #dbeafe;
+      font-size: 14px;
+      color: #6b7280;
+      line-height: 1.5;
+      margin: 0;
     }
     .card-auto__stats {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: var(--space-4);
-      margin-top: var(--space-2);
+      gap: 12px;
+      margin-top: 8px;
     }
     .stat-box {
-      background: rgba(255,255,255,.10);
-      border-radius: var(--radius-md);
-      padding: var(--space-3);
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      text-align: center;
+      transition: all 0.15s ease;
+    }
+    .stat-box:hover {
+      border-color: #d1d5db;
+      background: #fafbfc;
     }
     .stat-box__num {
-      font-size: var(--font-xl);
-      font-weight: 700;
-      color: var(--color-white);
-      line-height: 1.33;
+      font-size: 28px;
+      font-weight: 800;
+      color: #1f2937;
+      line-height: 1.2;
     }
     .stat-box__label {
-      font-size: var(--font-sm);
-      color: #dbeafe;
+      font-size: 13px;
+      color: #6b7280;
+      font-weight: 500;
     }
 
     /* AI Recommendations card */
     .card-ai {
-      background: var(--grad-purple);
-      border-radius: var(--radius-lg);
-      padding: var(--space-6);
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 24px;
       display: flex;
       flex-direction: column;
-      gap: var(--space-2);
+      gap: 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+      min-height: 200px;
+      user-select: none;
+      -webkit-user-select: none;
+      transition: all 0.15s ease;
     }
-
-    .flash {
-      border-radius: var(--radius-md);
-      padding: 10px 12px;
-      font-size: var(--font-sm);
-      margin-bottom: var(--space-3);
-    }
-    .flash--success {
-      background: #ecfdf3;
-      border: 1px solid #a7f3d0;
-      color: #065f46;
-    }
-    .flash--error {
-      background: #fef2f2;
-      border: 1px solid #fecaca;
-      color: #991b1b;
+    .card-ai:hover {
+      border-color: #d1d5db;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
     }
     .card-ai__title {
-      font-size: var(--font-lg);
+      font-size: 16px;
       font-weight: 700;
-      color: var(--color-white);
+      color: #1f2937;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
     }
     .card-ai__desc {
-      font-size: var(--font-sm);
-      color: #f3e8ff;
+      font-size: 14px;
+      color: #6b7280;
+      line-height: 1.5;
+      margin: 0;
     }
     .card-ai__list {
       display: flex;
       flex-direction: column;
-      gap: var(--space-2);
-      margin-top: var(--space-2);
+      gap: 10px;
+      margin-top: 4px;
     }
     .rec-item {
-      background: rgba(255,255,255,.10);
-      border-radius: var(--radius-md);
-      padding: var(--space-3);
-      display: flex;
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: 1fr auto;
       align-items: center;
-      justify-content: space-between;
-      height: 68px;
+      gap: 12px;
+      min-height: 60px;
+      user-select: none;
+      -webkit-user-select: none;
+      transition: all 0.15s ease;
+    }
+    .rec-item:hover {
+      border-color: #d1d5db;
+      background: #fafbfc;
     }
     .rec-item__name {
-      font-size: var(--font-sm);
-      font-weight: 700;
-      color: var(--color-white);
+      font-size: 14px;
+      font-weight: 600;
+      color: #1f2937;
+      margin: 0;
     }
     .rec-item__office {
-      font-size: var(--font-xs);
-      color: #f3e8ff;
+      font-size: 12px;
+      color: #6b7280;
+      font-weight: 400;
+      margin: 4px 0 0 0;
     }
     .rec-item__match {
       text-align: right;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
     }
     .rec-item__pct {
-      font-size: var(--font-lg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      background: #dbeafe;
+      color: #1e40af;
+      font-size: 12px;
       font-weight: 700;
-      color: var(--color-white);
+      letter-spacing: 0.04em;
     }
     .rec-item__label {
-      font-size: var(--font-xs);
-      color: #f3e8ff;
+      font-size: 11px;
+      color: #9ca3af;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
     }
 
     /* =============================================
-       SIDEBAR MOBILE OVERLAY
+       IMAGE LIGHTBOX  ← FIXED: moved OUT of media query
     ============================================= */
-    .sidebar-overlay {
-      display: none;
+    .image-lightbox {
       position: fixed;
       inset: 0;
-      background: rgba(0,0,0,.4);
-      z-index: 99;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 600;
+      padding: 20px;
+    }
+    .image-lightbox.is-open {
+      display: flex;
+    }
+    .image-lightbox__panel {
+      max-width: 95%;
+      max-height: 95%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+    .image-lightbox__panel img {
+      max-width: 100%;
+      max-height: 85vh;
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+    }
+    .image-lightbox__close {
+      position: fixed;
+      top: 18px;
+      right: 18px;
+      width: 40px;
+      height: 40px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.9);
+      border: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 18px;
+      color: #111827;
+      z-index: 601;
     }
 
     /* =============================================
        RESPONSIVE – TABLET (≤1024px)
     ============================================= */
     @media (max-width: 1024px) {
-      .sidebar {
-        position: fixed;
-        left: 0;
-        top: 0;
-        bottom: 0;
-        z-index: 100;
-        transform: translateX(-100%);
-        transition: transform .3s;
-      }
-      .sidebar.is-open { transform: translateX(0); }
-      .sidebar-overlay.is-open { display: block; }
-      .sidebar-toggle { display: flex; }
-      .topbar { padding-left: 64px; }
       .info-grid { grid-template-columns: 1fr; }
     }
 
@@ -839,132 +1235,87 @@ foreach ($applications as $app) {
        RESPONSIVE – MOBILE (≤768px)
     ============================================= */
     @media (max-width: 768px) {
-      .content { padding: var(--space-4); gap: var(--space-4); }
+      .page-alert { margin-bottom: 12px; }
       .toolbar { flex-direction: column; align-items: stretch; }
       .toolbar__left { flex-wrap: wrap; }
       .toolbar__search input { width: 100%; }
       .btn-export { justify-content: center; }
-      .topbar { padding: 0 var(--space-4) 0 64px; }
-      .topbar__title { font-size: var(--font-lg); }
       .topbar__user-info { display: none; }
+      .toolbar__left { gap: 8px; }
+      .filter-btn { width: 100%; justify-content: center; }
+      .filter-btn__count { margin-left: auto; }
+      .program-filter-select { width: 100%; max-width: none; }
+      .table-card { border-radius: 14px; }
+      .table-wrap { overflow: visible; }
+      table { min-width: 0; }
+      thead { display: none; }
+      tbody tr {
+        display: block;
+        padding: 12px;
+      }
+      tbody td {
+        display: block;
+        height: auto;
+        padding: 8px 0;
+      }
+      tbody td::before {
+        content: attr(data-label);
+        display: block;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--color-muted);
+        margin-bottom: 4px;
+      }
+      tbody td:first-child::before {
+        margin-bottom: 8px;
+      }
+      tbody td:last-child::before {
+        margin-bottom: 8px;
+      }
+      .actions { flex-wrap: wrap; }
+      .action-btn { width: 36px; height: 36px; }
+      .detail-grid { grid-template-columns: 1fr; }
+      .modal { padding: 12px; }
+      .modal__panel {
+        max-height: calc(100vh - 24px);
+        border-radius: 16px;
+      }
+      .modal__header,
+      .modal__body,
+      .modal__footer {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+      .modal__footer { justify-content: stretch; }
+      .modal__action,
+      .modal__button { width: 100%; }
+      .modal__footer { flex-direction: column; }
+      .modal__close { flex-shrink: 0; }
+      .card-auto__stats { grid-template-columns: 1fr; }
+    }
+    
+    /* Skill recommendation filter styles */
+    .skills-filter-tag:hover {
+      background-color: #2563eb !important;
+      color: #ffffff !important;
+      border-color: #2563eb !important;
+      box-shadow: 0 4px 6px rgba(37, 99, 235, 0.15) !important;
+      transform: translateY(-1px) !important;
+    }
+    .tr-recommended {
+      background-color: #f0f6ff !important;
+      border-left: 4px solid #3b82f6 !important;
     }
   </style>
+<link rel="stylesheet" href="../assets/css/sams-shell.css" />
+<link rel="stylesheet" href="../assets/css/sams-theme-admin.css" />
 </head>
 <body>
 
-<div class="app">
-
-  <!-- ============================================
-       SIDEBAR
-  ============================================= -->
-  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
-
-    <!-- Brand -->
-    <div class="sidebar__brand">
-      <div class="sidebar__logo" aria-hidden="true">NU</div>
-      <div>
-        <div class="sidebar__brand-name">SA System</div>
-        <div class="sidebar__brand-sub">Admin Panel</div>
-      </div>
-    </div>
-
-    <!-- Nav items -->
-    <nav class="sidebar__nav" aria-label="Site navigation">
-      <a class="nav-item" href="dashboard.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <rect x="2" y="2" width="7" height="7" rx="1.5" fill="currentColor"/>
-          <rect x="11" y="2" width="7" height="7" rx="1.5" fill="currentColor"/>
-          <rect x="2" y="11" width="7" height="7" rx="1.5" fill="currentColor"/>
-          <rect x="11" y="11" width="7" height="7" rx="1.5" fill="currentColor"/>
-        </svg>
-        <span class="nav-item__label">Dashboard</span>
-      </a>
-      <a class="nav-item nav-item--active" href="application.php" aria-current="page">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <rect x="3" y="2" width="14" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/>
-          <path d="M6 6h8M6 9.5h8M6 13h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Applications</span>
-        <span class="nav-item__badge">12</span>
-      </a>
-      <a class="nav-item" href="scheduling.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M4 3h12v14H4z" stroke="currentColor" stroke-width="1.6"/>
-          <path d="M4 7h12M7 3v4M13 3v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Scheduling</span>
-      </a>
-      <a class="nav-item" href="attendance.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.6"/>
-          <path d="M10 6v4l3 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Attendance</span>
-      </a>
-      <a class="nav-item" href="chat.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M4 4h12a2 2 0 012 2v6a2 2 0 01-2 2H9l-4 3v-3H4a2 2 0 01-2-2V6a2 2 0 012-2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-        </svg>
-        <span class="nav-item__label">Messages</span>
-      </a>
-      <a class="nav-item" href="documents.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M5 3h8l3 3v11H5z" stroke="currentColor" stroke-width="1.6"/>
-          <path d="M13 3v4h3" stroke="currentColor" stroke-width="1.6"/>
-        </svg>
-        <span class="nav-item__label">Documents</span>
-      </a>
-      <a class="nav-item" href="evaluation.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M4 10h12M4 5h12M4 15h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Evaluation</span>
-      </a>
-      <a class="nav-item" href="reports.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M4 16h12M6 13V9M10 13V6M14 13V4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Reports</span>
-      </a>
-      <a class="nav-item" href="students.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <circle cx="10" cy="7" r="3" stroke="currentColor" stroke-width="1.6"/>
-          <path d="M4 16c0-2.4 2.7-4.2 6-4.2s6 1.8 6 4.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Students</span>
-      </a>
-    </nav>
-
-    <!-- Footer nav -->
-    <div class="sidebar__footer">
-      <a class="nav-item" href="settings.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M10 2l2 2.2 3-.2.6 2.9 2.4 1.8-1.7 2.5.6 2.9-2.9.7-1.9 2.3-2.5-1.6-2.5 1.6-1.9-2.3-2.9-.7.6-2.9L1.9 8.7l2.4-1.8.6-2.9 3 .2L10 2z" stroke="currentColor" stroke-width="1.4"/>
-          <circle cx="10" cy="10" r="2.3" stroke="currentColor" stroke-width="1.4"/>
-        </svg>
-        <span class="nav-item__label">Settings</span>
-      </a>
-      <a class="nav-item" href="logout.php">
-        <svg class="nav-item__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <path d="M8 3H4.5A1.5 1.5 0 003 4.5v11A1.5 1.5 0 004.5 17H8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-          <path d="M12 7l3 3-3 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M15 10H7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-        <span class="nav-item__label">Sign Out</span>
-      </a>
-    </div>
-  </aside>
-
-  <!-- Mobile sidebar overlay -->
-  <div class="sidebar-overlay" id="sidebar-overlay" aria-hidden="true"></div>
-
-  <!-- Hamburger toggle -->
-  <button class="sidebar-toggle" id="sidebar-toggle"
-    aria-expanded="false" aria-controls="sidebar" aria-label="Toggle navigation">
-    <span class="sidebar-toggle__bar"></span>
-    <span class="sidebar-toggle__bar"></span>
-    <span class="sidebar-toggle__bar"></span>
-  </button>
+<div class="shell">
+<?php require_once __DIR__ . '/_sidebar.php'; ?>
 
   <!-- ============================================
        MAIN
@@ -980,63 +1331,144 @@ foreach ($applications as $app) {
       <div class="topbar__user">
         <div class="topbar__notif" aria-label="Notifications">
           <svg class="topbar__notif-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <path d="M6 8a4 4 0 118 0v3l1.5 1.5H4.5L6 11V8z" stroke="#4A5565" stroke-width="1.5" stroke-linejoin="round"/>
-            <path d="M8.2 14.5a2 2 0 003.6 0" stroke="#4A5565" stroke-width="1.5" stroke-linecap="round"/>
+            <path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zM10 18a3 3 0 01-3-3h6a3 3 0 01-3 3z" fill="#4A5565"/>
           </svg>
           <span class="topbar__notif-dot" aria-label="New notifications"></span>
         </div>
-          <div class="topbar__user-info">
-            <div class="topbar__user-name"><?php echo htmlspecialchars($_SESSION['admin_name'] ?? 'Admin'); ?></div>
-            <div class="topbar__user-role"><?php echo htmlspecialchars($_SESSION['admin_role'] ?? 'SDAO Head'); ?></div>
+        <div class="topbar__user-info">
+          <div class="topbar__user-name"><?= htmlspecialchars($admin_name, ENT_QUOTES, 'UTF-8') ?></div>
+          <div class="topbar__user-role">SDAO Head</div>
         </div>
         <div class="topbar__avatar">
-          <span class="topbar__avatar-text"><?php echo strtoupper(substr((string)($_SESSION['admin_name'] ?? 'A'), 0, 1)); ?></span>
+          <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <circle cx="10" cy="7" r="4" fill="white" opacity=".9"/>
+            <path d="M2 17c0-3.314 3.582-6 8-6s8 2.686 8 6" fill="white" opacity=".9"/>
+          </svg>
         </div>
       </div>
     </header>
 
     <!-- Page content -->
-    <main class="content" role="main">
+    <main class="page content" role="main">
 
-      <?php if ($flash_message !== ''): ?>
-        <div class="flash <?php echo $flash_type === 'error' ? 'flash--error' : 'flash--success'; ?>">
-          <?php echo htmlspecialchars($flash_message); ?>
-        </div>
+      <?php if ($flashMessage !== ''): ?>
+        <div class="page-alert page-alert--success" role="status"><?= htmlspecialchars($flashMessage) ?></div>
       <?php endif; ?>
+      <?php if ($flashError !== ''): ?>
+        <div class="page-alert page-alert--error" role="alert"><?= htmlspecialchars($flashError) ?></div>
+      <?php endif; ?>
+
+      <!-- ---- Skills Filter Tag Bar ---- -->
+      <div class="skills-filter-card" style="
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 24px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      ">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+          <div>
+            <h3 style="font-size: 15px; font-weight: 700; color: #111827; display: flex; align-items: center; gap: 6px;">
+              🔍 Skill-based Recommendation Filter
+            </h3>
+            <div style="font-size: 12px; color: #6b7280; margin-top: 2px;">
+              Select skills to filter applications and dynamically prioritize top candidates for Miss Zai.
+            </div>
+          </div>
+          <?php if (!empty($selectedSkills)): ?>
+            <a href="application.php" style="
+              font-size: 13px;
+              color: #dc2626;
+              font-weight: 600;
+              text-decoration: none;
+              display: inline-flex;
+              align-items: center;
+              gap: 4px;
+            ">
+              ✕ Clear Filter
+            </a>
+          <?php endif; ?>
+        </div>
+        <div class="skills-filter-tags" style="display: flex; flex-wrap: wrap; gap: 8px;">
+          <?php
+          $all_available_skills = [
+              'Time Management',
+              'Teamwork',
+              'Leadership',
+              'Problem Solving',
+              'Adaptability',
+              'Attention to Detail',
+              'Multitasking',
+              'Organization'
+          ];
+          foreach ($all_available_skills as $skill):
+              $isActive = in_array($skill, $selectedSkills, true);
+              
+              // Build query string toggling this skill
+              $tempSkills = $selectedSkills;
+              if ($isActive) {
+                  $tempSkills = array_diff($tempSkills, [$skill]);
+              } else {
+                  $tempSkills[] = $skill;
+              }
+              $queryString = !empty($tempSkills) ? '?filter_skills=' . urlencode(implode(',', $tempSkills)) : 'application.php';
+          ?>
+            <a href="<?= $queryString ?>" class="skills-filter-tag" style="
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              padding: 8px 14px;
+              font-size: 13px;
+              font-weight: 600;
+              color: <?= $isActive ? '#ffffff' : '#4b5563' ?>;
+              background: <?= $isActive ? 'linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%)' : '#f3f4f6' ?>;
+              border: 1px solid <?= $isActive ? '#2563eb' : '#e5e7eb' ?>;
+              border-radius: 9999px;
+              text-decoration: none;
+              transition: all 0.2s ease;
+              cursor: pointer;
+            ">
+              <?= htmlspecialchars($skill) ?>
+            </a>
+          <?php endforeach; ?>
+        </div>
+      </div>
 
       <!-- ---- Toolbar ---- -->
       <div class="toolbar">
         <div class="toolbar__left">
           <!-- Search -->
           <div class="toolbar__search">
-            <svg class="toolbar__search-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-              <circle cx="9" cy="9" r="5.5" stroke="#6B7280" stroke-width="1.6"/>
-              <path d="M13.5 13.5L17 17" stroke="#6B7280" stroke-width="1.6" stroke-linecap="round"/>
-            </svg>
+            <span class="toolbar__search-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="9" cy="9" r="6" stroke="#6A7282" stroke-width="1.6"/>
+                <path d="M13.5 13.5L17 17" stroke="#6A7282" stroke-width="1.6" stroke-linecap="round"/>
+              </svg>
+            </span>
             <input type="search" id="search-input" placeholder="Search applicants..."
               aria-label="Search applicants" />
           </div>
           <!-- Filter buttons -->
-          <button class="filter-btn filter-btn--active" data-filter="all"   aria-pressed="true">
-            All <span class="filter-btn__count">(<?php echo $total_all; ?>)</span>
+          <?php foreach ($statusFilterOptions as $filterKey => $filterLabel): ?>
+          <button class="filter-btn <?= $filterKey === 'all' ? 'filter-btn--active' : 'filter-btn--inactive' ?>"
+            data-filter="<?= htmlspecialchars($filterKey) ?>"
+            aria-pressed="<?= $filterKey === 'all' ? 'true' : 'false' ?>">
+            <?= htmlspecialchars($filterLabel) ?>
+            <span class="filter-btn__count">(<?= (int) ($filterKey === 'all' ? $applicationCounts['all'] : $applicationCounts[$filterKey]) ?>)</span>
           </button>
-          <button class="filter-btn filter-btn--inactive" data-filter="pending"   aria-pressed="false">
-            Pending <span class="filter-btn__count">(<?php echo $total_pending; ?>)</span>
-          </button>
-          <button class="filter-btn filter-btn--inactive" data-filter="interview" aria-pressed="false">
-            Interview <span class="filter-btn__count">(<?php echo $total_interview; ?>)</span>
-          </button>
-          <button class="filter-btn filter-btn--inactive" data-filter="approved"  aria-pressed="false">
-            Approved <span class="filter-btn__count">(<?php echo $total_approved; ?>)</span>
-          </button>
-          <button class="filter-btn filter-btn--inactive" data-filter="rejected"  aria-pressed="false">
-            Rejected <span class="filter-btn__count">(<?php echo $total_rejected; ?>)</span>
-          </button>
+          <?php endforeach; ?>
+          <select id="program-filter" class="program-filter-select" aria-label="Filter applications by course or program">
+            <option value="">All Courses / Programs</option>
+            <?php foreach ($courseOptions as $courseCode => $courseLabel): ?>
+              <option value="<?= htmlspecialchars($courseCode, ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($courseLabel, ENT_QUOTES, 'UTF-8') ?></option>
+            <?php endforeach; ?>
+          </select>
         </div>
         <a class="btn-export" href="#" aria-label="Export applicant list">
-          <svg class="btn-export__icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <path d="M8 2v7M8 9L5.5 6.5M8 9l2.5-2.5" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M3 11.5v1.5h10v-1.5" stroke="white" stroke-width="1.6" stroke-linecap="round"/>
+          <svg class="btn-export__icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M10 3v9M10 12L6.5 8.5M10 12l3.5-3.5" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M3 14.5v1A1.5 1.5 0 004.5 17h11A1.5 1.5 0 0017 15.5v-1" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
           </svg>
           Export List
         </a>
@@ -1058,103 +1490,79 @@ foreach ($applications as $app) {
               </tr>
             </thead>
             <tbody id="table-body">
+
               <?php if (empty($applications)): ?>
-                <tr>
-                  <td colspan="7">No applications yet. New applicants will appear here in real time.</td>
-                </tr>
+              <tr>
+                <td colspan="7" style="padding: 32px; text-align: center; color: var(--color-muted);">
+                  No applications have been submitted yet.
+                </td>
+              </tr>
               <?php else: ?>
-                <?php foreach ($applications as $app): ?>
-                  <?php
-                    $fullName  = $app['full_name'] ?? '';
-                    $studentId = $app['student_id'] ?? '';
-                    $course    = $app['course'] ?? '';
-                    $workLoc   = $app['work_location'] ?? '';
-                    $skillsStr = $app['skills'] ?? '';
-                    $createdAt = $app['created_at'] ?? '';
-
-                    $nameParts = preg_split('/\s+/', trim($fullName));
-                    $initials  = '';
-                    if (!empty($nameParts[0])) {
-                      $initials .= strtoupper(substr($nameParts[0], 0, 1));
-                    }
-                    if (count($nameParts) > 1 && !empty($nameParts[count($nameParts)-1])) {
-                      $initials .= strtoupper(substr($nameParts[count($nameParts)-1], 0, 1));
-                    }
-
-                    $appliedDisplay = '';
-                    if (!empty($createdAt)) {
-                      $ts = strtotime($createdAt);
-                      if ($ts !== false) {
-                        $appliedDisplay = 'Applied ' . date('M d, Y', $ts);
-                      }
-                    }
-
-                    $skillsList = [];
-                    if (!empty($skillsStr)) {
-                      foreach (explode(',', $skillsStr) as $s) {
-                        $trim = trim($s);
-                        if ($trim !== '') {
-                          $skillsList[] = $trim;
-                        }
-                      }
-                    }
-
-                    $status      = strtolower(trim((string) ($app['application_status'] ?? 'pending')));
-                    $badgeClass  = 'badge--pending';
-                    $statusLabel = 'Pending';
-                    if ($status === 'approved') {
-                      $badgeClass = 'badge--approved';
-                      $statusLabel = 'Approved';
-                    } elseif ($status === 'rejected') {
-                      $badgeClass = 'badge--rejected';
-                      $statusLabel = 'Rejected';
-                    }
-                  ?>
-                  <tr data-status="<?php echo $status; ?>">
-                    <td>
-                      <div class="applicant">
-                        <div class="applicant__avatar" aria-hidden="true"><?php echo htmlspecialchars($initials ?: 'SA'); ?></div>
-                        <div>
-                          <div class="applicant__name"><?php echo htmlspecialchars($fullName); ?></div>
-                          <div class="applicant__date"><?php echo htmlspecialchars($appliedDisplay); ?></div>
-                        </div>
+                <?php foreach ($applications as $application): ?>
+                <?php
+                  $fullName = trim((string) ($application['first_name'] ?? '') . ' ' . (string) ($application['last_name'] ?? ''));
+                  $avatar = sams_application_avatar($fullName);
+                  $skills = sams_application_skill_tags($application['skills'] ?? null);
+                  $status = (string) ($application['status'] ?? 'pending');
+                  $submittedAt = $application['submitted_at'] ? date('M j, Y', strtotime((string) $application['submitted_at'])) : 'N/A';
+                  $skillsText = implode(', ', $skills);
+                ?>
+              <tr data-status="<?= htmlspecialchars($status) ?>" data-program="<?= htmlspecialchars((string) ($application['program'] ?? ''), ENT_QUOTES, 'UTF-8') ?>" class="<?= !empty($application['is_recommended']) ? 'tr-recommended' : '' ?>">
+                <td data-label="Applicant">
+                  <div class="applicant">
+                    <div class="applicant__avatar" aria-hidden="true"><?= htmlspecialchars($avatar) ?></div>
+                    <div>
+                      <div class="applicant__name">
+                        <?= htmlspecialchars($fullName !== '' ? $fullName : 'Unnamed Applicant') ?>
+                        <?php if (!empty($application['is_recommended'])): ?>
+                          <?php 
+                            $recTitle = "This student has the highest available hours (" . round((float)($application['total_available_hours'] ?? 0), 1) . " hrs/week)";
+                            if (!empty($selectedSkills)) {
+                              $appSkills = sams_application_skill_tags($application['skills'] ?? null);
+                              $matches = array_intersect($appSkills, $selectedSkills);
+                              $recTitle = "Matches " . count($matches) . " selected skill(s): " . implode(', ', $matches);
+                            }
+                          ?>
+                          <span class="badge badge--recommended" title="<?= htmlspecialchars($recTitle) ?>">🌟 Top Recommended</span>
+                        <?php endif; ?>
                       </div>
-                    </td>
-                    <td><?php echo htmlspecialchars($studentId); ?></td>
-                    <td><?php echo htmlspecialchars($course); ?></td>
-                    <td><?php echo htmlspecialchars($workLoc); ?></td>
-                    <td>
-                      <div class="skills">
-                        <?php foreach ($skillsList as $skill): ?>
-                          <span class="skill-tag"><?php echo htmlspecialchars($skill); ?></span>
-                        <?php endforeach; ?>
-                      </div>
-                    </td>
-                    <td><span class="badge <?php echo $badgeClass; ?>"><?php echo $statusLabel; ?></span></td>
-                    <td>
-                      <div class="actions">
-                        <form method="post" action="" style="display:inline;">
-                          <input type="hidden" name="student_id" value="<?php echo htmlspecialchars($studentId); ?>">
-                          <input type="hidden" name="action" value="approve">
-                          <button class="action-btn action-btn--approve" type="submit" title="Approve application" aria-label="Approve <?php echo htmlspecialchars($fullName); ?>">
-                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
-                          </button>
-                        </form>
-                        <form method="post" action="" style="display:inline;">
-                          <input type="hidden" name="student_id" value="<?php echo htmlspecialchars($studentId); ?>">
-                          <input type="hidden" name="action" value="reject">
-                          <button class="action-btn action-btn--reject" type="submit" title="Reject application" aria-label="Reject <?php echo htmlspecialchars($fullName); ?>">
-                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
-                          </button>
-                        </form>
-                        <a class="action-btn action-btn--view" href="application-view.php?student_id=<?php echo urlencode($studentId); ?>" title="View application" aria-label="View <?php echo htmlspecialchars($fullName); ?>">
-                          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.477 0 8.268 2.943 9.542 7-1.274 4.057-5.065 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-                        </a>
-                      </div>
-                    </td>
-                  </tr>
+                      <div class="applicant__date">Applied <?= htmlspecialchars($submittedAt) ?></div>
+                    </div>
+                  </div>
+                </td>
+                <td data-label="Student ID"><?= htmlspecialchars((string) ($application['student_id_number'] ?? '')) ?></td>
+                <td data-label="Program"><?= htmlspecialchars((string) ($application['program'] ?? '')) ?></td>
+                <td data-label="Preferred Office"><?= htmlspecialchars((string) ($application['preferred_office'] ?? '')) ?></td>
+                <td data-label="Skills">
+                  <div class="skills">
+                    <?php if (empty($skills)): ?>
+                      <span class="skill-tag">No skills listed</span>
+                    <?php else: ?>
+                      <?php foreach (array_slice($skills, 0, 3) as $skill): ?>
+                        <span class="skill-tag"><?= htmlspecialchars($skill) ?></span>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </div>
+                </td>
+                <td data-label="Status"><span class="badge <?= htmlspecialchars(sams_application_status_class($status)) ?>"><?= htmlspecialchars(sams_application_status_label($status)) ?></span></td>
+                <td data-label="Actions">
+                  <div class="actions">
+                    <a
+                      class="action-btn action-btn--view-text"
+                      href="application_view.php?application_id=<?= (int) $application['application_id'] ?>"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="View application"
+                      aria-label="View <?= htmlspecialchars($fullName !== '' ? $fullName : 'applicant') ?>"
+                    >
+                      View
+                    </a>
+                  </div>
+                </td>
+              </tr>
                 <?php endforeach; ?>
               <?php endif; ?>
+
             </tbody>
           </table>
         </div>
@@ -1165,16 +1573,16 @@ foreach ($applications as $app) {
 
         <!-- Auto-Filtering card -->
         <div class="card-auto">
-          <div class="card-auto__title">🤖 Auto-Filtering Active</div>
-          <div class="card-auto__desc">Requirements are automatically verified. Only qualified applicants are shown above.</div>
+          <div class="card-auto__title">🤖 Live Applications</div>
+          <div class="card-auto__desc">Applications are loaded directly from the database. Only submitted applicants are shown above.</div>
           <div class="card-auto__stats">
             <div class="stat-box">
-              <div class="stat-box__num">28</div>
-              <div class="stat-box__label">Qualified</div>
+              <div class="stat-box__num"><?= (int) $applicationCounts['all'] ?></div>
+              <div class="stat-box__label">Total Applications</div>
             </div>
             <div class="stat-box">
-              <div class="stat-box__num">7</div>
-              <div class="stat-box__label">Filtered Out</div>
+              <div class="stat-box__num"><?= (int) $applicationCounts['pending'] ?></div>
+              <div class="stat-box__label">Pending</div>
             </div>
           </div>
         </div>
@@ -1182,28 +1590,30 @@ foreach ($applications as $app) {
         <!-- AI Recommendations card -->
         <div class="card-ai">
           <div class="card-ai__title">✨ AI Recommendations</div>
-          <div class="card-ai__desc">Based on skills, availability, and office needs</div>
+          <div class="card-ai__desc">Based on the latest submitted application records</div>
           <div class="card-ai__list">
-            <div class="rec-item">
-              <div>
-                <div class="rec-item__name">John Reyes</div>
-                <div class="rec-item__office">Computer Lab</div>
+            <?php if (empty($applications)): ?>
+              <div class="rec-item">
+                <div>
+                  <div class="rec-item__name">No applications yet</div>
+                  <div class="rec-item__office">Wait for student submissions</div>
+                </div>
               </div>
-              <div class="rec-item__match">
-                <div class="rec-item__pct">95%</div>
-                <div class="rec-item__label">Match</div>
-              </div>
-            </div>
-            <div class="rec-item">
-              <div>
-                <div class="rec-item__name">Maria Santos</div>
-                <div class="rec-item__office">SDAO Office</div>
-              </div>
-              <div class="rec-item__match">
-                <div class="rec-item__pct">92%</div>
-                <div class="rec-item__label">Match</div>
-              </div>
-            </div>
+            <?php else: ?>
+              <?php foreach (array_slice($applications, 0, 2) as $application): ?>
+                <?php $fullName = trim((string) ($application['first_name'] ?? '') . ' ' . (string) ($application['last_name'] ?? '')); ?>
+                <div class="rec-item">
+                  <div>
+                    <div class="rec-item__name"><?= htmlspecialchars($fullName !== '' ? $fullName : 'Unnamed Applicant') ?></div>
+                    <div class="rec-item__office"><?= htmlspecialchars((string) ($application['preferred_office'] ?? '')) ?></div>
+                  </div>
+                  <div class="rec-item__match">
+                    <div class="rec-item__pct"><?= htmlspecialchars(strtoupper((string) ($application['status'] ?? 'PENDING'))) ?></div>
+                    <div class="rec-item__label">Status</div>
+                  </div>
+                </div>
+              <?php endforeach; ?>
+            <?php endif; ?>
           </div>
         </div>
 
@@ -1212,7 +1622,90 @@ foreach ($applications as $app) {
     </main>
   </div><!-- /.main -->
 
+  <!-- ============================================
+       APPLICATION DETAIL MODAL
+  ============================================= -->
+  <div class="modal" id="application-modal" aria-hidden="true" role="dialog" aria-labelledby="application-modal-title">
+    <div class="modal__panel" role="document">
+      <div class="modal__header">
+        <div>
+          <h2 class="modal__title" id="application-modal-title">Applicant Details</h2>
+          <div class="modal__subtitle" id="application-modal-subtitle">Review the submission before making a decision.</div>
+        </div>
+        <button class="modal__close" type="button" id="application-modal-close" aria-label="Close details panel">&times;</button>
+      </div>
+      <div class="modal__body">
+        <div class="detail-grid">
+          <div class="detail-item">
+            <span class="detail-item__label">Applicant</span>
+            <div class="detail-item__value" id="modal-name"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Student ID</span>
+            <div class="detail-item__value" id="modal-student-id"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Email</span>
+            <div class="detail-item__value" id="modal-email"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Program / Year Level</span>
+            <div class="detail-item__value" id="modal-program"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Preferred Office</span>
+            <div class="detail-item__value" id="modal-office"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Status</span>
+            <div class="detail-item__value" id="modal-status"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Submitted At</span>
+            <div class="detail-item__value" id="modal-submitted-at"></div>
+          </div>
+          <div class="detail-item">
+            <span class="detail-item__label">Skills</span>
+            <div class="detail-item__value modal__skills" id="modal-skills"></div>
+          </div>
+          <div class="detail-item" style="grid-column: 1 / -1;">
+            <span class="detail-item__label">Documents</span>
+            <div class="detail-item__value" id="modal-documents">Loading documents…</div>
+          </div>
+          <div class="detail-item" style="grid-column: 1 / -1;">
+            <span class="detail-item__label">Availability</span>
+            <div class="detail-item__value" id="modal-availability">Loading availability…</div>
+          </div>
+        </div>
+      </div>
+      <div class="modal__footer">
+        <button class="modal__button modal__button--ghost" type="button" id="modal-cancel">Close</button>
+        <form class="modal__action" method="post" id="modal-approve-form">
+          <input type="hidden" name="application_id" id="modal-approve-id" value="" />
+          <input type="hidden" name="review_action" value="approve" />
+          <button class="modal__button modal__button--approve" type="submit">Approve</button>
+          <button id="resendEmailBtn" class="modal__button" type="button" style="margin-left:8px;background:#f3f4f6;color:#111;border:1px solid var(--color-border);">Resend Email</button>
+        </form>
+        <form class="modal__action" method="post" id="modal-reject-form">
+          <input type="hidden" name="application_id" id="modal-reject-id" value="" />
+          <input type="hidden" name="review_action" value="reject" />
+          <button class="modal__button modal__button--reject" type="submit">Reject</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
 </div><!-- /.app -->
+
+<!-- ============================================
+     IMAGE LIGHTBOX
+============================================= -->
+<div class="image-lightbox" id="image-lightbox" aria-hidden="true" role="dialog" aria-label="Document preview">
+  <div class="image-lightbox__panel" id="image-lightbox-panel">
+    <button class="image-lightbox__close" id="image-lightbox-close" aria-label="Close image">&times;</button>
+    <img id="image-lightbox-img" src="" alt="" />
+  </div>
+</div>
 
 <script>
   (function () {
@@ -1224,32 +1717,50 @@ foreach ($applications as $app) {
     var overlay = document.getElementById('sidebar-overlay');
 
     function openSidebar() {
+      if (!sidebar || !overlay || !toggle) return;
       sidebar.classList.add('is-open');
       overlay.classList.add('is-open');
       overlay.setAttribute('aria-hidden', 'false');
       toggle.setAttribute('aria-expanded', 'true');
     }
     function closeSidebar() {
+      if (!sidebar || !overlay || !toggle) return;
       sidebar.classList.remove('is-open');
       overlay.classList.remove('is-open');
       overlay.setAttribute('aria-hidden', 'true');
       toggle.setAttribute('aria-expanded', 'false');
     }
 
-    toggle.addEventListener('click', function () {
-      sidebar.classList.contains('is-open') ? closeSidebar() : openSidebar();
-    });
-    overlay.addEventListener('click', closeSidebar);
+    if (toggle && sidebar && overlay) {
+      toggle.addEventListener('click', function () {
+        sidebar.classList.contains('is-open') ? closeSidebar() : openSidebar();
+      });
+      overlay.addEventListener('click', closeSidebar);
+    }
 
     /* ---- Filter buttons ---- */
     var filterBtns = document.querySelectorAll('.filter-btn');
     var rows = document.querySelectorAll('#table-body tr');
+    var activeStatusFilter = 'all';
+    var programFilter = document.getElementById('program-filter');
+    var searchInput = document.getElementById('search-input');
+
+    function applyApplicationFilters() {
+      var selectedProgram = programFilter ? programFilter.value.toLowerCase().trim() : '';
+      var searchQuery = searchInput ? searchInput.value.toLowerCase().trim() : '';
+
+      rows.forEach(function (row) {
+        var matchesStatus = activeStatusFilter === 'all' || row.getAttribute('data-status') === activeStatusFilter;
+        var matchesProgram = !selectedProgram || (row.getAttribute('data-program') || '').toLowerCase().trim() === selectedProgram;
+        var matchesSearch = !searchQuery || row.textContent.toLowerCase().includes(searchQuery);
+        row.style.display = matchesStatus && matchesProgram && matchesSearch ? '' : 'none';
+      });
+    }
 
     filterBtns.forEach(function (btn) {
       btn.addEventListener('click', function () {
-        var filter = btn.getAttribute('data-filter');
+        activeStatusFilter = btn.getAttribute('data-filter');
 
-        /* Update button states */
         filterBtns.forEach(function (b) {
           b.classList.remove('filter-btn--active');
           b.classList.add('filter-btn--inactive');
@@ -1259,26 +1770,384 @@ foreach ($applications as $app) {
         btn.classList.remove('filter-btn--inactive');
         btn.setAttribute('aria-pressed', 'true');
 
-        /* Filter rows */
-        rows.forEach(function (row) {
-          var status = row.getAttribute('data-status');
-          row.style.display = (filter === 'all' || status === filter) ? '' : 'none';
-        });
+        applyApplicationFilters();
       });
     });
 
     /* ---- Live search ---- */
-    var searchInput = document.getElementById('search-input');
-    searchInput.addEventListener('input', function () {
-      var q = this.value.toLowerCase().trim();
-      rows.forEach(function (row) {
-        var text = row.textContent.toLowerCase();
-        row.style.display = (!q || text.includes(q)) ? '' : 'none';
+    if (searchInput) {
+      searchInput.addEventListener('input', applyApplicationFilters);
+    }
+    if (programFilter) {
+      programFilter.addEventListener('change', applyApplicationFilters);
+    }
+
+    /* ---- Image lightbox ---- */
+    var lightbox      = document.getElementById('image-lightbox');
+    var lightboxClose = document.getElementById('image-lightbox-close');
+    var lightboxPanel = document.getElementById('image-lightbox-panel');
+    var lightboxImg   = document.getElementById('image-lightbox-img');
+
+    function showImageModal(src, alt) {
+      if (!lightbox || !lightboxImg) return;
+      lightboxImg.src = src;
+      lightboxImg.alt = alt || '';
+      lightboxImg.onerror = function () {
+        lightboxImg.src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="200" height="120"%3E%3Crect fill="%23f3f4f6" width="200" height="120"/%3E%3Ctext x="50%25" y="50%25" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="13" fill="%236b7280"%3EImage not found%3C/text%3E%3C/svg%3E';
+      };
+      lightbox.classList.add('is-open');
+      lightbox.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeImageModal() {
+      if (!lightbox || !lightboxImg) return;
+      lightbox.classList.remove('is-open');
+      lightbox.setAttribute('aria-hidden', 'true');
+      lightboxImg.src = '';
+      lightboxImg.alt = '';
+    }
+
+    if (lightboxClose) {
+      lightboxClose.addEventListener('click', function (e) {
+        e.stopPropagation();
+        closeImageModal();
       });
+    }
+    if (lightbox) {
+      lightbox.addEventListener('click', function (e) {
+        if (e.target === lightbox) closeImageModal();
+      });
+    }
+    if (lightboxPanel) {
+      lightboxPanel.addEventListener('click', function (e) {
+        e.stopPropagation();
+      });
+    }
+
+    /* ---- Applicant details modal ---- */
+    var modal       = document.getElementById('application-modal');
+    var modalClose  = document.getElementById('application-modal-close');
+    var modalCancel = document.getElementById('modal-cancel');
+    var modalButtons = document.querySelectorAll('.action-btn--view');
+    var approveId   = document.getElementById('modal-approve-id');
+    var rejectId    = document.getElementById('modal-reject-id');
+
+    var modalFields = {
+      name:        document.getElementById('modal-name'),
+      studentId:   document.getElementById('modal-student-id'),
+      email:       document.getElementById('modal-email'),
+      program:     document.getElementById('modal-program'),
+      office:      document.getElementById('modal-office'),
+      status:      document.getElementById('modal-status'),
+      submittedAt: document.getElementById('modal-submitted-at'),
+      skills:      document.getElementById('modal-skills')
+    };
+
+    function setSkills(value) {
+      modalFields.skills.innerHTML = '';
+      var items = (value || '').split(',').map(function (i) { return i.trim(); }).filter(Boolean);
+      if (items.length === 0) { items = ['No skills listed']; }
+      items.forEach(function (item) {
+        var span = document.createElement('span');
+        span.className = 'skill-tag';
+        span.textContent = item;
+        modalFields.skills.appendChild(span);
+      });
+    }
+
+    function renderDocuments(docs) {
+
+  var container = document.getElementById('modal-documents');
+
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  if (!Array.isArray(docs) || docs.length === 0) {
+
+    container.innerHTML = `
+      <div style="
+        padding:12px;
+        border-radius:10px;
+        background:#f9fafb;
+        color:#6b7280;
+        font-size:14px;
+      ">
+        No documents uploaded.
+      </div>
+    `;
+
+    return;
+  }
+
+  docs.forEach(function (doc) {
+
+    var wrapper = document.createElement('div');
+
+    wrapper.style.background = '#f8fafc';
+    wrapper.style.border = '1px solid #e5e7eb';
+    wrapper.style.borderRadius = '14px';
+    wrapper.style.padding = '16px';
+    wrapper.style.marginBottom = '16px';
+
+    /* ---------------- TITLE ---------------- */
+
+    var title = document.createElement('div');
+
+    title.style.fontSize = '14px';
+    title.style.fontWeight = '700';
+    title.style.marginBottom = '12px';
+    title.style.color = '#111827';
+
+    title.textContent =
+      (doc.document_type || 'Document') +
+      ' • ' +
+      (doc.original_filename || 'file');
+
+    wrapper.appendChild(title);
+
+    /* ---------------- FILE ---------------- */
+
+    var mime = (doc.mime_type || '').toLowerCase();
+
+    var filePath = '';
+
+    if (doc.file_path) {
+      filePath = '../' + doc.file_path;
+    }
+
+    /* ---------------- IMAGE ---------------- */
+
+    if (mime.startsWith('image/') && filePath) {
+
+      var image = document.createElement('img');
+
+      image.src = filePath;
+
+      image.alt =
+        doc.original_filename || 'Uploaded Document';
+
+      image.style.width = '160px';
+      image.style.height = '160px';
+      image.style.objectFit = 'cover';
+      image.style.borderRadius = '12px';
+      image.style.border = '1px solid #d1d5db';
+      image.style.cursor = 'pointer';
+      image.style.transition = '0.2s ease';
+      image.style.display = 'block';
+      image.style.background = '#ffffff';
+
+      image.addEventListener('mouseover', function () {
+        image.style.transform = 'scale(1.03)';
+      });
+
+      image.addEventListener('mouseout', function () {
+        image.style.transform = 'scale(1)';
+      });
+
+      image.addEventListener('click', function (e) {
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        var lightbox =
+          document.getElementById('image-lightbox');
+
+        var lightboxImg =
+          document.getElementById('image-lightbox-img');
+
+        if (!lightbox || !lightboxImg) return;
+
+        lightboxImg.src = filePath;
+
+        lightboxImg.alt =
+          doc.original_filename || 'Preview';
+
+        lightbox.classList.add('is-open');
+
+        lightbox.setAttribute(
+          'aria-hidden',
+          'false'
+        );
+      });
+
+      image.onerror = function () {
+
+        image.src =
+          'https://via.placeholder.com/160x160?text=Image+Not+Found';
+      };
+
+      wrapper.appendChild(image);
+
+    }
+
+    /* ---------------- PDF / FILE ---------------- */
+
+    else if (filePath) {
+
+      var fileLink = document.createElement('a');
+
+      fileLink.href = filePath;
+
+      fileLink.target = '_blank';
+
+      fileLink.textContent =
+        '📄 Open ' +
+        (doc.original_filename || 'Document');
+
+      fileLink.style.display = 'inline-block';
+      fileLink.style.padding = '10px 14px';
+      fileLink.style.background = '#2563eb';
+      fileLink.style.color = '#ffffff';
+      fileLink.style.borderRadius = '10px';
+      fileLink.style.fontSize = '14px';
+      fileLink.style.fontWeight = '600';
+      fileLink.style.textDecoration = 'none';
+
+      wrapper.appendChild(fileLink);
+
+    }
+
+    /* ---------------- NO FILE ---------------- */
+
+    else {
+
+      var unavailable = document.createElement('div');
+
+      unavailable.textContent =
+        'File not available.';
+
+      unavailable.style.color = '#dc2626';
+
+      wrapper.appendChild(unavailable);
+    }
+
+    container.appendChild(wrapper);
+  });
+}
+
+    function formatTime12Hour(timeStr) {
+      if (!timeStr) return '';
+      var time = timeStr.substr(0, 5); // Get HH:MM
+      var parts = time.split(':');
+      var hours = parseInt(parts[0], 10);
+      var minutes = parts[1] || '00';
+      var ampm = hours >= 12 ? 'PM' : 'AM';
+      var displayHours = hours > 12 ? hours - 12 : (hours === 0 ? 12 : hours);
+      return (displayHours < 10 ? '0' : '') + displayHours + ':' + minutes + ' ' + ampm;
+    }
+
+    function renderAvailability(list) {
+      var container = document.getElementById('modal-availability');
+      if (!container) return;
+      container.innerHTML = '';
+
+      if (!Array.isArray(list) || list.length === 0) {
+        container.textContent = 'No availability provided.';
+        return;
+      }
+
+      var ul = document.createElement('ul');
+      ul.style.cssText = 'list-style:none;padding:0;margin:0;';
+      list.forEach(function (row) {
+        var li = document.createElement('li');
+        li.style.padding = '6px 0';
+        var start = formatTime12Hour(row.time_start || row.start_time || '');
+        var end = formatTime12Hour(row.time_end || row.end_time || '');
+        li.textContent = (row.day_of_week || '') + ': ' + start + ' — ' + end;
+        ul.appendChild(li);
+      });
+      container.appendChild(ul);
+    }
+
+    function openModal(button) {
+      modalFields.name.textContent        = button.getAttribute('data-name') || '';
+      modalFields.studentId.textContent   = button.getAttribute('data-student-id') || '';
+      modalFields.email.textContent       = button.getAttribute('data-email') || '';
+      modalFields.program.textContent     = ((button.getAttribute('data-program') || '') + ' • ' + (button.getAttribute('data-year-level') || '')).trim();
+      modalFields.office.textContent      = button.getAttribute('data-office') || '';
+      modalFields.status.textContent      = button.getAttribute('data-status') || '';
+      modalFields.submittedAt.textContent = button.getAttribute('data-submitted-at') || '';
+      setSkills(button.getAttribute('data-skills') || '');
+
+      var appId = button.getAttribute('data-application-id') || '';
+      approveId.value = appId;
+      rejectId.value  = appId;
+
+      document.getElementById('modal-documents').innerHTML  = 'Loading documents…';
+      document.getElementById('modal-availability').innerHTML = 'Loading availability…';
+
+      modal.classList.add('is-open');
+      modal.setAttribute('aria-hidden', 'false');
+
+      if (appId) {
+        fetch('application_detail.php?application_id=' + encodeURIComponent(appId), { credentials: 'same-origin' })
+          .then(function (res) {
+            if (!res.ok) throw new Error('Failed to load details');
+            return res.json();
+          })
+          .then(function (json) {
+            renderDocuments(json.documents || []);
+            renderAvailability(json.availability || []);
+          })
+          .catch(function () {
+            document.getElementById('modal-documents').textContent  = 'Unable to load documents.';
+            document.getElementById('modal-availability').textContent = 'Unable to load availability.';
+          });
+      }
+    }
+
+    function closeModal() {
+      modal.classList.remove('is-open');
+      modal.setAttribute('aria-hidden', 'true');
+    }
+
+    modalButtons.forEach(function (btn) {
+      btn.addEventListener('click', function () { openModal(btn); });
     });
+
+    modalClose.addEventListener('click', closeModal);
+    modalCancel.addEventListener('click', closeModal);
+    modal.addEventListener('click', function (e) {
+      if (e.target === modal) closeModal();
+    });
+
+    /* ---- Global Escape key handler ---- */
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      if (lightbox && lightbox.classList.contains('is-open')) {
+        closeImageModal();
+      } else if (modal.classList.contains('is-open')) {
+        closeModal();
+      }
+    });
+
+    // Resend approval email button handler
+    var resendBtn = document.getElementById('resendEmailBtn');
+    if (resendBtn) {
+      resendBtn.addEventListener('click', function () {
+        var id = parseInt(document.getElementById('modal-approve-id').value || '0', 10);
+        if (!id) return alert('No application selected');
+        resendBtn.disabled = true;
+        fetch('resend_application_email.php', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ application_id: id })
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (d && d.success) {
+            alert('Email resent');
+          } else {
+            alert('Failed to resend: ' + (d && d.message ? d.message : 'Unknown'));
+          }
+        }).catch(function (e) { console.error(e); alert('Request failed'); }).finally(function () { resendBtn.disabled = false; });
+      });
+    }
 
   }());
 </script>
+
+<script src="../assets/js/admin-notifications.js?v=20260922"></script>
 
 </body>
 </html>

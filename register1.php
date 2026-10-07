@@ -1,30 +1,38 @@
 <?php
-// register1.php – NU SAMS Student Assistant Application (Step 2: Academic Information)
-// Student Assistant Management System | National University – Lipa
+declare(strict_types=1);
 
-session_start();
+require_once __DIR__ . '/config/bootstrap.php';
+
+if (empty($_SESSION['sams_registration']['step1'])) {
+    header('Location: register.php');
+    exit;
+}
+
+$step1_link = 'register.php';
+$step2_link = 'register1.php';
+$step3_link = (!empty($_SESSION['sams_registration']['step1']) && !empty($_SESSION['sams_registration']['step2'])) ? 'register3.php' : '#';
+$step4_link = (!empty($_SESSION['sams_registration']['step1']) && !empty($_SESSION['sams_registration']['step2']) && !empty($_SESSION['sams_registration']['step3'])) ? 'register2.php' : '#';
 
 $errors = [];
 $values = [
     'course'          => '',
     'year_level'      => '',
+    'units'           => '',
     'gpa'             => '',
-    'sdao_experience' => '',
-    'hours_per_week'  => '',
 ];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $values['course']          = trim($_POST['course']          ?? '');
     $values['year_level']      = trim($_POST['year_level']      ?? '');
+    $values['units']           = trim($_POST['units']           ?? '');
     $values['gpa']             = trim($_POST['gpa']             ?? '');
-    $values['sdao_experience'] = trim($_POST['sdao_experience'] ?? '');
-    $values['hours_per_week']  = trim($_POST['hours_per_week']  ?? '');
 
     // Required fields validation
     if ($values['course']          === '') $errors['course']          = 'Course/Program is required.';
     if ($values['year_level']      === '') $errors['year_level']      = 'Year Level is required.';
-    if ($values['sdao_experience'] === '') $errors['sdao_experience'] = 'Please indicate your SDAO experience.';
-    if ($values['hours_per_week']  === '') $errors['hours_per_week']  = 'Available hours per week is required.';
+    if ($values['units'] === '' || filter_var($values['units'], FILTER_VALIDATE_INT) === false || (int) $values['units'] < 1 || (int) $values['units'] > 40) {
+        $errors['units'] = 'Enter your current units (1-40).';
+    }
 
     // Optional GPA – validate format if provided
     if ($values['gpa'] !== '' && !preg_match('/^\d+(\.\d{1,2})?$/', $values['gpa'])) {
@@ -32,10 +40,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if (empty($errors)) {
-      // Store step 2 data in session then redirect to step 3
-      $_SESSION['step2'] = $values;
+      $_SESSION['sams_registration'] = array_merge($_SESSION['sams_registration'] ?? [], [
+        'step2' => $values,
+      ]);
 
-      header('Location: register2.php');
+      header('Location: register3.php');
       exit;
     }
 }
@@ -68,6 +77,7 @@ function isSelected(string $key, string $option, array $values): string {
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="assets/css/sams-design-system.css" />
   <style>
     /* =============================================
        CSS VARIABLES / DESIGN TOKENS
@@ -184,7 +194,7 @@ function isSelected(string $key, string $option, array $values): string {
       justify-content: center;
       margin-bottom: var(--space-5);
     }
-    .page-header__icon-wrap img { width: 32px; height: 32px; }
+    .page-header__icon-wrap img, .page-header__icon-wrap svg { width: 32px; height: 32px; }
     .page-header__title {
       font-size: var(--font-2xl);
       font-weight: 900;
@@ -444,7 +454,7 @@ function isSelected(string $key, string $option, array $values): string {
       transition: background .2s;
     }
     .form-nav__back:hover { background: rgba(0,48,135,.05); }
-    .form-nav__back img { width: 20px; height: 20px; }
+    .form-nav__back img, .form-nav__back svg { width: 20px; height: 20px; display: block; }
 
     .form-nav__next {
       display: inline-flex;
@@ -463,7 +473,7 @@ function isSelected(string $key, string $option, array $values): string {
       transition: opacity .2s;
     }
     .form-nav__next:hover { opacity: .88; }
-    .form-nav__next img { width: 20px; height: 20px; }
+    .form-nav__next img, .form-nav__next svg { width: 20px; height: 20px; display: block; }
 
     /* =============================================
        RESPONSIVE – TABLET (≤1024px)
@@ -500,22 +510,14 @@ function isSelected(string $key, string $option, array $values): string {
 
     <!-- Back to Home -->
     <a class="back-link" href="index.php">
-      <img
-        class="back-link__icon"
-        src="https://www.figma.com/api/mcp/asset/555aa9ae-c186-4d40-8d38-faf1e28ff813"
-        alt=""
-        aria-hidden="true"
-      />
+      <svg class="back-link__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M19 12H5m6-6-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Back to Home
     </a>
 
     <!-- Page header -->
     <header class="page-header">
       <div class="page-header__icon-wrap" aria-hidden="true">
-        <img
-          src="https://www.figma.com/api/mcp/asset/543102a2-b95a-4025-a58c-2d2593ebb144"
-          alt="Graduation cap icon"
-        />
+        <svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="m3 12 13-7 13 7-13 7L3 12Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8 15v6c3 3 13 3 16 0v-6M29 12v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
       </div>
       <h1 class="page-header__title">Student Assistant Application</h1>
       <p class="page-header__subtitle">Complete the 4-step process to apply</p>
@@ -543,7 +545,7 @@ function isSelected(string $key, string $option, array $values): string {
       <nav class="progress-card__steps" aria-label="Application steps">
 
         <!-- Step 1 – completed / active highlight -->
-        <a class="step-tab step-tab--active" href="register.php" aria-label="Step 1: Personal Info (completed)">
+        <a class="step-tab step-tab--active" href="<?= $step1_link ?>" aria-label="Step 1: Personal Info (completed)">
           <svg class="step-tab__svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
           </svg>
@@ -559,19 +561,19 @@ function isSelected(string $key, string $option, array $values): string {
         </div>
 
         <!-- Step 3 – locked -->
-        <a class="step-tab" href="#" aria-label="Step 3: Requirements (not yet available)">
+        <a class="step-tab" href="<?= $step3_link ?>" aria-label="Step 3: Assessment">
           <svg class="step-tab__svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>
-          <span class="step-tab__label">Requirements</span>
+          <span class="step-tab__label">Assessment</span>
         </a>
 
         <!-- Step 4 – locked -->
-        <a class="step-tab" href="#" aria-label="Step 4: Assessment (not yet available)">
+        <a class="step-tab" href="<?= $step4_link ?>" aria-label="Step 4: Requirements">
           <svg class="step-tab__svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
           </svg>
-          <span class="step-tab__label">Assessment</span>
+          <span class="step-tab__label">Requirements</span>
         </a>
 
       </nav>
@@ -581,12 +583,7 @@ function isSelected(string $key, string $option, array $values): string {
     <section class="form-card" aria-labelledby="academic-info-heading">
 
       <div class="form-card__heading">
-        <img
-          class="form-card__heading-icon"
-          src="https://www.figma.com/api/mcp/asset/1006700c-4b45-477a-9f83-45d134914662"
-          alt=""
-          aria-hidden="true"
-        />
+        <svg class="form-card__heading-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v16l-8-4-8 4V5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
         <h2 class="form-card__heading-text" id="academic-info-heading">Academic Information</h2>
       </div>
 
@@ -606,13 +603,9 @@ function isSelected(string $key, string $option, array $values): string {
                 aria-required="true"
               >
                 <option value="" <?php echo isSelected('course', '', $values); ?>>Select course</option>
-                <option value="BSIT"  <?php echo isSelected('course', 'BSIT',  $values); ?>>BS Information Technology</option>
-                <option value="BSCS"  <?php echo isSelected('course', 'BSCS',  $values); ?>>BS Computer Science</option>
-                <option value="BSBA"  <?php echo isSelected('course', 'BSBA',  $values); ?>>BS Business Administration</option>
-                <option value="BEED"  <?php echo isSelected('course', 'BEED',  $values); ?>>Bachelor of Elementary Education</option>
-                <option value="BSED"  <?php echo isSelected('course', 'BSED',  $values); ?>>Bachelor of Secondary Education</option>
-                <option value="BSHM"  <?php echo isSelected('course', 'BSHM',  $values); ?>>BS Hospitality Management</option>
-                <option value="OTHER" <?php echo isSelected('course', 'OTHER', $values); ?>>Other</option>
+                <?php foreach (sams_course_options() as $courseCode => $courseLabel): ?>
+                  <option value="<?= htmlspecialchars($courseCode, ENT_QUOTES, 'UTF-8') ?>" <?= isSelected('course', $courseCode, $values) ?>><?= htmlspecialchars($courseLabel, ENT_QUOTES, 'UTF-8') ?></option>
+                <?php endforeach; ?>
               </select>
             </div>
             <?php echo err('course', $errors); ?>
@@ -656,46 +649,25 @@ function isSelected(string $key, string $option, array $values): string {
             <?php echo err('gpa', $errors); ?>
           </div>
 
-          <!-- Previous SDAO Experience -->
           <div class="form__group">
-            <label class="form__label" for="sdao_experience">Previous SDAO Experience? *</label>
-            <div class="form__select-wrap">
-              <select
-                class="<?php echo selectClass('sdao_experience', $errors); ?>"
-                id="sdao_experience"
-                name="sdao_experience"
-                required
-                aria-required="true"
-              >
-                <option value="" <?php echo isSelected('sdao_experience', '', $values); ?>>Select option</option>
-                <option value="yes" <?php echo isSelected('sdao_experience', 'yes', $values); ?>>Yes</option>
-                <option value="no"  <?php echo isSelected('sdao_experience', 'no',  $values); ?>>No</option>
-              </select>
-            </div>
-            <?php echo err('sdao_experience', $errors); ?>
+            <label class="form__label" for="units">Current Units *</label>
+            <input
+              class="<?php echo inputClass('units', $errors); ?>"
+              type="number"
+              id="units"
+              name="units"
+              min="1"
+              max="40"
+              step="1"
+              placeholder="e.g., 18"
+              value="<?php echo val('units', $values); ?>"
+              required
+              aria-required="true"
+            />
+            <?php echo err('units', $errors); ?>
           </div>
 
-          <!-- Available Hours Per Week – full width -->
-          <div class="form__group form__group--full">
-            <label class="form__label" for="hours_per_week">Available Hours Per Week *</label>
-            <div class="form__select-wrap">
-              <select
-                class="<?php echo selectClass('hours_per_week', $errors); ?>"
-                id="hours_per_week"
-                name="hours_per_week"
-                required
-                aria-required="true"
-              >
-                <option value=""    <?php echo isSelected('hours_per_week', '',    $values); ?>>Select hours</option>
-                <option value="5"   <?php echo isSelected('hours_per_week', '5',   $values); ?>>5 hours/week</option>
-                <option value="10"  <?php echo isSelected('hours_per_week', '10',  $values); ?>>10 hours/week</option>
-                <option value="15"  <?php echo isSelected('hours_per_week', '15',  $values); ?>>15 hours/week</option>
-                <option value="20"  <?php echo isSelected('hours_per_week', '20',  $values); ?>>20 hours/week</option>
-                <option value="25"  <?php echo isSelected('hours_per_week', '25',  $values); ?>>25 hours/week</option>
-              </select>
-            </div>
-            <?php echo err('hours_per_week', $errors); ?>
-          </div>
+
 
         </div><!-- /.form__grid -->
 
@@ -711,11 +683,7 @@ function isSelected(string $key, string $option, array $values): string {
     <div class="form-nav">
 
       <a class="form-nav__back" href="register.php" aria-label="Go back to Step 1: Personal Info">
-        <img
-          src="https://www.figma.com/api/mcp/asset/555aa9ae-c186-4d40-8d38-faf1e28ff813"
-          alt=""
-          aria-hidden="true"
-        />
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M19 12H5m6-6-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Back
       </a>
 
@@ -723,14 +691,10 @@ function isSelected(string $key, string $option, array $values): string {
         class="form-nav__next"
         type="submit"
         form="academic-form"
-        aria-label="Proceed to Step 3: Requirements"
+        aria-label="Proceed to Step 3: Assessment"
       >
         Next
-        <img
-          src="https://www.figma.com/api/mcp/asset/d9edad4f-8377-4fdc-a04c-964b22cfc8e8"
-          alt=""
-          aria-hidden="true"
-        />
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
 
     </div>
@@ -805,53 +769,6 @@ function isSelected(string $key, string $option, array $values): string {
         });
       }
 
-    })();
-  </script>
-
-  <script>
-    (function () {
-      'use strict';
-
-      var iconSvgs = {
-        'default': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="18" height="18" rx="4" fill="#EAF2FF"/><path d="M8 8h8v8H8z" stroke="#155DFC" stroke-width="1.8"/><path d="M7 16l3.5-3.5 2.5 2.5L15.5 12 17 13.5" stroke="#155DFC" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-        'back': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M14.5 6.5L9 12l5.5 5.5" stroke="#155DFC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-        'next': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M9.5 6.5L15 12l-5.5 5.5" stroke="#155DFC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-        'cap': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M3 9l9-4 9 4-9 4-9-4z" stroke="#155DFC" stroke-width="1.8"/><path d="M7 11.5V15c0 .7 2.2 2 5 2s5-1.3 5-2v-3.5" stroke="#155DFC" stroke-width="1.8" stroke-linecap="round"/></svg>',
-        'book': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M4 6.5c2-1 4-1 6 0v12c-2-1-4-1-6 0v-12zM14 6.5c2-1 4-1 6 0v12c-2-1-4-1-6 0v-12z" stroke="#155DFC" stroke-width="1.8" stroke-linejoin="round"/></svg>'
-      };
-
-      function fallbackSrcFor(key) {
-        var svg = iconSvgs[key] || iconSvgs.default;
-        return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg);
-      }
-
-      function iconKeyFor(img) {
-        var cls = String(img.className || '').toLowerCase();
-        var alt = String(img.getAttribute('alt') || '').toLowerCase();
-        var text = String((img.closest('a,button,li,div') || {}).textContent || '').toLowerCase();
-        var hint = cls + ' ' + alt + ' ' + text;
-
-        if (hint.indexOf('back') !== -1 || hint.indexOf('home') !== -1) return 'back';
-        if (hint.indexOf('next') !== -1 || hint.indexOf('proceed') !== -1) return 'next';
-        if (hint.indexOf('graduation') !== -1 || hint.indexOf('cap') !== -1 || hint.indexOf('header') !== -1) return 'cap';
-        if (hint.indexOf('academic') !== -1 || hint.indexOf('course') !== -1 || hint.indexOf('heading-icon') !== -1) return 'book';
-        return 'default';
-      }
-
-      function setFallback(img) {
-        if (!img || img.getAttribute('data-icon-fallback') === '1') {
-          return;
-        }
-        img.setAttribute('data-icon-fallback', '1');
-        img.src = fallbackSrcFor(iconKeyFor(img));
-      }
-
-      document.querySelectorAll('img[src*="figma.com/api/mcp/asset"]').forEach(function (img) {
-        img.addEventListener('error', function () { setFallback(img); }, { once: true });
-        if (img.complete && img.naturalWidth === 0) {
-          setFallback(img);
-        }
-      });
     })();
   </script>
 

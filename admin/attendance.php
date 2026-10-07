@@ -1,224 +1,174 @@
 <?php
-// attendance.php — NU SA System | Admin Panel — Attendance Monitoring
-// National University - Student Development and Activities Office
+declare(strict_types=1);
 
-session_start();
+require_once __DIR__ . '/../config/bootstrap.php';
 
-if (!isset($_SESSION['admin_id'])) {
-    header('Location: login.php');
+$currentUser = sams_authenticated_user();
+if (!$currentUser || (($currentUser['role'] ?? null) !== 'admin')) {
+    header('Location: ../login.php');
     exit;
 }
+$admin_name = (string) ($currentUser['name'] ?? 'SAMS Admin');
 
-require_once __DIR__ . '/../db.php';
+$pdo = sams_pdo();
+$attendanceOfficeOptions = array_merge(sams_office_options(), ['Unassigned']);
 
-$admin_name = $_SESSION['admin_name'] ?? 'Admin';
-$admin_role = $_SESSION['admin_role'] ?? 'SDAO Head';
+$applicationBadgeCount = (int) $pdo->query("SELECT COUNT(*) FROM applications WHERE status = 'pending'")->fetchColumn();
 
-$has_checkout_column = false;
-if ($colRes = $mysqli->query("SHOW COLUMNS FROM attendance LIKE 'check_out_time'")) {
-    $has_checkout_column = $colRes->num_rows > 0;
-    $colRes->free();
+$currentDay = date('l');
+$activeTerm = sams_current_term($pdo);
+$activeTermId = (int) ($activeTerm['term_id'] ?? 0);
+
+function sams_admin_attendance_display_name(array $row): string
+{
+    $fullName = trim((string) ($row['first_name'] ?? '') . ' ' . (string) ($row['last_name'] ?? ''));
+    return $fullName !== '' ? $fullName : 'Unassigned Student';
 }
 
-if (!$has_checkout_column) {
-    $mysqli->query("ALTER TABLE attendance ADD COLUMN check_out_time DATETIME NULL DEFAULT NULL AFTER check_in_time");
-    if ($colRes = $mysqli->query("SHOW COLUMNS FROM attendance LIKE 'check_out_time'")) {
-        $has_checkout_column = $colRes->num_rows > 0;
-        $colRes->free();
-    }
+function sams_admin_attendance_dot(string $status): string
+{
+    $status = strtolower($status);
+    return match ($status) {
+        'completed', 'present' => 'green',
+        'active', 'late' => 'blue',
+        default => 'grey',
+    };
 }
 
-// Add validation_status column if it doesn't exist
-$has_validation_column = false;
-if ($colRes = $mysqli->query("SHOW COLUMNS FROM attendance LIKE 'validation_status'")) {
-    $has_validation_column = $colRes->num_rows > 0;
-    $colRes->free();
-}
-
-if (!$has_validation_column) {
-    $mysqli->query("ALTER TABLE attendance ADD COLUMN validation_status ENUM('pending', 'accepted', 'rejected') NOT NULL DEFAULT 'pending' AFTER check_out_time");
-}
-
-// Handle validation POST request
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'], $_POST['attendance_id'])) {
-    if ($_POST['action'] === 'validate_attendance') {
-        $attId = (int)$_POST['attendance_id'];
-        $newStatus = in_array($_POST['val_status'], ['accepted', 'rejected']) ? $_POST['val_status'] : 'pending';
-        
-        if ($stmt = $mysqli->prepare("UPDATE attendance SET validation_status = ? WHERE id = ?")) {
-            $stmt->bind_param('si', $newStatus, $attId);
-            $stmt->execute();
-            $stmt->close();
-        }
-        
-        // Redirect to avoid form resubmission
-        header('Location: attendance.php?period=' . urlencode($_GET['period'] ?? 'today'));
-        exit;
-    }
-}
-
-
-$allowedPeriods = ['today', 'yesterday', 'week', 'month'];
-$selected_period = strtolower(trim((string) ($_GET['period'] ?? 'today')));
-if (!in_array($selected_period, $allowedPeriods, true)) {
-    $selected_period = 'today';
-}
-
-$whereSql = 'DATE(check_in_time) = CURDATE()';
-$periodLabel = date('l, F j, Y');
-switch ($selected_period) {
-    case 'yesterday':
-        $whereSql = 'DATE(check_in_time) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)';
-        $periodLabel = date('l, F j, Y', strtotime('-1 day'));
-        break;
-    case 'week':
-        $whereSql = 'YEARWEEK(check_in_time, 1) = YEARWEEK(CURDATE(), 1)';
-        $monday = date('F j, Y', strtotime('monday this week'));
-        $sunday = date('F j, Y', strtotime('sunday this week'));
-        $periodLabel = 'Week of ' . $monday . ' - ' . $sunday;
-        break;
-    case 'month':
-        $whereSql = 'YEAR(check_in_time) = YEAR(CURDATE()) AND MONTH(check_in_time) = MONTH(CURDATE())';
-        $periodLabel = date('F Y');
-        break;
+$todayRows = [];
+if ($activeTermId > 0) {
+    $todayRowsStmt = $pdo->prepare(
+        'SELECT u.first_name, u.last_name, s.student_id AS student_code,
+                COALESCE(NULLIF(TRIM(ds.office_name), ""), NULLIF(TRIM(a.preferred_office), ""), "Unassigned") AS office_name,
+                al.clock_in_time AS time_in, al.clock_out_time AS time_out, al.status, al.late_minutes, ds.start_time
+         FROM duty_schedules ds
+         INNER JOIN applications a ON a.application_id = ds.application_id
+         LEFT JOIN students s ON s.student_id = a.student_id
+         LEFT JOIN users u ON u.user_id = s.user_id
+         LEFT JOIN attendance_logs al ON al.log_id = (
+             SELECT al2.log_id
+             FROM attendance_logs al2
+             WHERE al2.application_id = ds.application_id
+               AND al2.duty_id = ds.duty_id
+               AND DATE(al2.created_at) = CURDATE()
+             ORDER BY al2.log_id DESC
+             LIMIT 1
+         )
+         WHERE ds.day_of_week = :day
+           AND ds.status = "deployed"
+           AND ds.term_id = :term_id
+         ORDER BY ds.start_time ASC'
+    );
+    $todayRowsStmt->execute([
+        'day' => $currentDay,
+        'term_id' => $activeTermId,
+    ]);
+    $todayRows = $todayRowsStmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 }
 
 $attendance_rows = [];
-$attendanceSql = "SELECT id, student_id, student_name, location, status, check_in_time, check_out_time, validation_status
-                  FROM attendance
-                  WHERE {$whereSql}
-                  ORDER BY check_in_time DESC
-                  LIMIT 300";
+$activeNow = 0;
+$completedToday = 0;
+$recordedSeconds = 0;
+$totalSchedules = count($todayRows);
+$officeSummary = [];
 
-if ($result = $mysqli->query($attendanceSql)) {
-    while ($row = $result->fetch_assoc()) {
-        $statusRaw = strtolower(trim((string) ($row['status'] ?? '')));
-        $isOpenLog = empty($row['check_out_time']);
-        $isPresent = $statusRaw === 'present';
-        $statusLabel = $isOpenLog ? 'In Progress' : 'Completed';
-        $statusClass = $isOpenLog ? 'att-status--active' : 'att-status--present';
+foreach ($todayRows as $row) {
+    $status = sams_attendance_display_status((string) ($row['status'] ?? ''));
+    if ($status === '') {
+        $status = 'absent';
+    }
 
-        $timeInValue = !empty($row['check_in_time']) ? (string) $row['check_in_time'] : null;
-        $timeOutValue = !empty($row['check_out_time']) ? (string) $row['check_out_time'] : null;
-        $durationValue = '-';
-        if ($timeInValue !== null && $timeOutValue !== null) {
-            $startTs = strtotime($timeInValue);
-            $endTs = strtotime($timeOutValue);
-            if ($startTs !== false && $endTs !== false && $endTs >= $startTs) {
-                $diffMinutes = (int) floor(($endTs - $startTs) / 60);
-                $hours = intdiv($diffMinutes, 60);
-                $minutes = $diffMinutes % 60;
-                $durationValue = sprintf('%dh %02dm', $hours, $minutes);
-            }
+    $timeIn = !empty($row['time_in']) ? (string) $row['time_in'] : null;
+    $timeOut = !empty($row['time_out']) ? (string) $row['time_out'] : null;
+
+    if (!sams_attendance_clocking_enabled()) {
+        $timeIn = null;
+        $timeOut = null;
+        $status = 'absent';
+    }
+
+    if ($timeIn !== null && $timeOut === null) {
+        $activeNow++;
+    }
+    if ($timeIn !== null && $timeOut !== null) {
+        $completedToday++;
+        $startTimestamp = strtotime($timeIn);
+        $endTimestamp = strtotime($timeOut);
+        if ($startTimestamp !== false && $endTimestamp !== false && $endTimestamp > $startTimestamp) {
+            $recordedSeconds += $endTimestamp - $startTimestamp;
         }
+    }
 
-        $attendance_rows[] = [
-            'id' => (int)($row['id'] ?? 0),
-            'dot' => $isOpenLog ? 'orange' : 'green',
-            'name' => (string) ($row['student_name'] ?? 'Unknown Student'),
-            'office' => (string) ($row['location'] ?? 'Unassigned'),
-            'time_in' => !empty($row['check_in_time']) ? date('g:i A', strtotime((string) $row['check_in_time'])) : '-',
-            'time_out' => !empty($row['check_out_time']) ? date('g:i A', strtotime((string) $row['check_out_time'])) : '-',
-            'duration' => $durationValue,
-            'method' => 'System',
-            'status' => $statusLabel,
-            'status_class' => $statusClass,
-            'is_open' => $isOpenLog,
-            'validation_status' => (string)($row['validation_status'] ?? 'pending'),
+    $officeName = (string) ($row['office_name'] ?? 'Unassigned');
+    if (!isset($officeSummary[$officeName])) {
+        $officeSummary[$officeName] = [
+            'name' => $officeName,
+            'count' => 0,
+            'active' => 0,
         ];
     }
-    $result->free();
-}
-
-$today_total = 0;
-$today_present = 0;
-if ($result = $mysqli->query("SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present_count FROM attendance WHERE DATE(check_in_time) = CURDATE()")) {
-    if ($row = $result->fetch_assoc()) {
-        $today_total = (int) ($row['total'] ?? 0);
-        $today_present = (int) ($row['present_count'] ?? 0);
+    $officeSummary[$officeName]['count']++;
+    if ($timeIn !== null && $timeOut === null) {
+        $officeSummary[$officeName]['active']++;
     }
-    $result->free();
+
+    $attendance_rows[] = [
+        'dot' => sams_admin_attendance_dot($status),
+        'name' => sams_admin_attendance_display_name($row),
+        'office' => $officeName,
+        'date_label' => $currentDateLabel ?? date('D, M j, Y'),
+        'schedule_start' => (string) ($row['start_time'] ?? ''),
+        'time_in' => $timeIn ? date('g:i A', strtotime($timeIn)) : '-',
+        'time_out' => $timeOut ? date('g:i A', strtotime($timeOut)) : ($timeIn ? 'In Progress' : '-'),
+        'duration' => sams_attendance_duration_label($timeIn, $timeOut),
+        'method' => !empty($timeIn) ? 'Live DB' : '-',
+        'status' => match ($status) {
+            'present', 'completed' => 'Present',
+            'late' => 'Late',
+            'active' => 'Active',
+            default => 'Absent',
+        },
+    ];
 }
-
-$on_time_pct = $today_total > 0 ? (int) round(($today_present / $today_total) * 100) : 0;
-
-$month_logs = 0;
-if ($result = $mysqli->query("SELECT COUNT(*) AS c FROM attendance WHERE YEAR(check_in_time) = YEAR(CURDATE()) AND MONTH(check_in_time) = MONTH(CURDATE())")) {
-    if ($row = $result->fetch_assoc()) {
-        $month_logs = (int) ($row['c'] ?? 0);
-    }
-    $result->free();
-}
-
-$daysElapsed = max(1, (int) date('j'));
-$avg_logs_per_day = $month_logs > 0 ? round($month_logs / $daysElapsed, 1) : 0;
-
-$active_now = 0;
-if ($result = $mysqli->query("SELECT COUNT(*) AS c FROM attendance WHERE DATE(check_in_time) = CURDATE() AND check_out_time IS NULL AND check_in_time >= DATE_SUB(NOW(), INTERVAL 4 HOUR)")) {
-    if ($row = $result->fetch_assoc()) {
-        $active_now = (int) ($row['c'] ?? 0);
-    }
-    $result->free();
-}
-
-$verified_logs = 0;
-if ($result = $mysqli->query("SELECT COUNT(*) AS c FROM attendance WHERE check_out_time IS NOT NULL")) {
-    if ($row = $result->fetch_assoc()) {
-        $verified_logs = (int) ($row['c'] ?? 0);
-    }
-    $result->free();
-}
-
-$total_logs = 0;
-if ($result = $mysqli->query("SELECT COUNT(*) AS c FROM attendance")) {
-    if ($row = $result->fetch_assoc()) {
-        $total_logs = (int) ($row['c'] ?? 0);
-    }
-    $result->free();
-}
-
-$accuracy_pct = $total_logs > 0 ? (int) round(($verified_logs / $total_logs) * 100) : 0;
 
 $offices = [];
-$officeSql = "SELECT COALESCE(NULLIF(location, ''), 'Unassigned') AS office_name, COUNT(*) AS c
-              FROM attendance
-              WHERE {$whereSql}
-              GROUP BY office_name
-              ORDER BY c DESC
-              LIMIT 5";
+foreach ($officeSummary as $office) {
+    $name = (string) ($office['name'] ?? 'Unassigned');
+    $count = (int) ($office['count'] ?? 0);
+    $active = (int) ($office['active'] ?? 0);
+    $pct = $totalSchedules > 0 ? (int) round(($count / $totalSchedules) * 100) : 0;
 
-$palette = ['blue', 'green', 'purple', 'orange', 'grey'];
-$maxOfficeCount = 0;
-if ($result = $mysqli->query($officeSql)) {
-    while ($row = $result->fetch_assoc()) {
-        $count = (int) ($row['c'] ?? 0);
-        $maxOfficeCount = max($maxOfficeCount, $count);
-        $offices[] = [
-            'name' => (string) ($row['office_name'] ?? 'Unassigned'),
-            'count' => $count,
-            'pct' => 0,
-            'color' => 'grey',
-        ];
+    $color = 'grey';
+    $lower = strtolower($name);
+    if (str_contains($lower, 'sdao')) {
+        $color = 'blue';
+    } elseif (str_contains($lower, 'library')) {
+        $color = 'green';
+    } elseif (str_contains($lower, 'computer')) {
+        $color = 'purple';
+    } elseif (str_contains($lower, 'registrar')) {
+        $color = 'orange';
     }
-    $result->free();
+
+    $offices[] = [
+        'name' => $name,
+        'count' => $count,
+        'pct' => $pct,
+        'color' => $color,
+        'active' => $active,
+    ];
 }
 
-if ($maxOfficeCount > 0) {
-    foreach ($offices as $idx => $office) {
-        $offices[$idx]['pct'] = (int) round(($office['count'] / $maxOfficeCount) * 100);
-        $offices[$idx]['color'] = $palette[$idx % count($palette)];
-    }
-}
+$verifiedCount = $completedToday + $activeNow;
+$attendanceRate = $totalSchedules > 0 ? (int) round(($verifiedCount / $totalSchedules) * 100) : 0;
 
-if (empty($offices)) {
-    $offices[] = ['name' => 'No data', 'count' => 0, 'pct' => 0, 'color' => 'grey'];
-}
+$currentDateLabel = date('l, F j, Y');
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <script src="../assets/realtime.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Attendance Monitoring | NU SA System</title>
     <style>
@@ -342,8 +292,8 @@ if (empty($offices)) {
 
         .sidebar__header {
             height: 89px;
-            border-bottom: 1px solid var(--clr-border);
-            padding: var(--sp-24) var(--sp-24) 0;
+            border-bottom: none;
+            padding: 0;
             flex-shrink: 0;
         }
 
@@ -351,7 +301,8 @@ if (empty($offices)) {
             display: flex;
             align-items: center;
             gap: var(--sp-12);
-            height: 40px;
+            padding: var(--sp-24) var(--sp-24) 20px;
+            border-bottom: 1px solid var(--clr-border);
         }
 
         .sidebar__logo {
@@ -467,6 +418,9 @@ if (empty($offices)) {
             align-items: center;
             justify-content: space-between;
             flex-shrink: 0;
+            position: sticky;
+            top: 0;
+            z-index: 50;
         }
 
         .topbar__left { display: flex; align-items: center; gap: var(--sp-12); }
@@ -631,6 +585,7 @@ if (empty($offices)) {
             cursor: pointer;
             transition: border-color 0.15s;
         }
+        .filter-select.office-filter { width: 280px; }
         .filter-select:focus { border-color: var(--clr-blue); }
 
         /* Export Button */
@@ -718,81 +673,101 @@ if (empty($offices)) {
         .table-card {
             background: var(--clr-white);
             border: 1px solid var(--clr-border);
-            border-radius: var(--radius-md);
+            border-radius: 12px;
+            box-shadow: 0 4px 16px rgba(16, 24, 40, .06);
             overflow: hidden;
         }
 
         .table-card__header {
             border-bottom: 1px solid var(--clr-border);
-            padding: var(--sp-24);
+            padding: 18px 22px;
             display: flex;
-            flex-direction: column;
-            gap: var(--sp-4);
-            min-height: 101px;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            min-height: 76px;
+            background: #fff;
         }
 
         .table-card__title {
             font-size: var(--fs-md);
             font-weight: bold;
             color: var(--clr-text-primary);
-            line-height: 28px;
+            line-height: 1.3;
+            letter-spacing: 0;
         }
 
         .table-card__date {
             font-size: var(--fs-sm);
             color: var(--clr-text-muted);
-            line-height: 20px;
+            line-height: 1.4;
+            padding: 6px 10px;
+            border: 1px solid var(--clr-border);
+            border-radius: 7px;
+            background: #f8fafc;
+            white-space: nowrap;
         }
 
         /* Table */
-        .att-table-wrap { overflow-x: auto; }
+        .att-table-wrap { max-height: min(68vh, 720px); overflow: auto; }
 
         .att-table {
             width: 100%;
-            min-width: 900px;
+            min-width: 1080px;
             border-collapse: collapse;
             table-layout: fixed;
         }
 
-        .att-table col.col-sa       { width: 17%; }
-        .att-table col.col-office   { width: 14%; }
-        .att-table col.col-timein   { width: 14%; }
+        .att-table col.col-sa       { width: 18%; }
+        .att-table col.col-date     { width: 12%; }
+        .att-table col.col-office   { width: 16%; }
+        .att-table col.col-timein   { width: 12%; }
         .att-table col.col-timeout  { width: 12%; }
         .att-table col.col-duration { width: 10%; }
         .att-table col.col-method   { width: 10%; }
         .att-table col.col-status   { width: 10%; }
-        .att-table col.col-validation { width: 13%; }
 
         .att-table thead th {
-            background: var(--clr-bg);
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            background: #f8fafc;
             border-bottom: 1px solid var(--clr-border);
-            padding: 16px var(--sp-24);
+            padding: 13px 16px;
             text-align: left;
-            font-size: var(--fs-sm);
-            font-weight: bold;
+            font-size: 11px;
+            font-weight: 700;
             color: var(--clr-text-primary);
-            height: 52.5px;
+            text-transform: uppercase;
+            height: 44px;
         }
 
         .att-table tbody tr {
             border-bottom: 1px solid var(--clr-border);
+            transition: background .15s ease;
         }
         .att-table tbody tr:last-child { border-bottom: none; }
+        .att-table tbody tr:hover { background: #f8fafc; }
 
         .att-table tbody td {
-            padding: 0 var(--sp-24);
-            height: 57px;
+            padding: 12px 16px;
+            min-height: 56px;
             vertical-align: middle;
-            font-size: var(--fs-base);
+            font-size: 13px;
             color: var(--clr-text-primary);
-            line-height: 24px;
+            line-height: 1.45;
         }
+
+        .att-date { color: var(--clr-text-muted) !important; white-space: nowrap; }
+        .att-office { font-weight: 600; overflow-wrap: anywhere; }
+        .att-table__empty { padding: 36px 20px !important; text-align: center; color: var(--clr-text-muted) !important; }
 
         /* Name cell with dot */
         .att-name {
             display: flex;
             align-items: center;
             gap: var(--sp-12);
+            font-weight: 600;
         }
 
         .att-dot {
@@ -804,7 +779,6 @@ if (empty($offices)) {
         .att-dot--green  { background: var(--clr-green-vivid); }
         .att-dot--blue   { background: var(--clr-blue-dot); }
         .att-dot--grey   { background: var(--clr-grey-dot); }
-        .att-dot--orange { background: var(--clr-orange); }
 
         /* Duration bold */
         .att-duration { font-weight: bold; }
@@ -826,17 +800,16 @@ if (empty($offices)) {
         .att-status {
             display: inline-flex;
             align-items: center;
-            height: 24px;
-            padding: 4px 12px;
+            min-height: 26px;
+            padding: 4px 10px;
             border-radius: var(--radius-pill);
             font-size: var(--fs-xs);
+            font-weight: 700;
             white-space: nowrap;
         }
         .att-status--completed { background: var(--clr-status-completed-bg); color: var(--clr-status-completed-text); }
         .att-status--active    { background: var(--clr-status-active-bg);    color: var(--clr-status-active-text); }
         .att-status--scheduled { background: var(--clr-status-scheduled-bg); color: var(--clr-status-scheduled-text); }
-        .att-status--present   { background: var(--clr-status-completed-bg); color: var(--clr-status-completed-text); }
-        .att-status--absent    { background: #fef2f2; color: #b42318; }
 
         /* ============================================================
            BOTTOM PANELS ROW
@@ -1008,169 +981,20 @@ if (empty($offices)) {
             .stat-card { min-height: auto; }
             .search-wrap { width: 100%; }
             .filter-select { width: 120px; }
+            .filter-select.office-filter { width: 100%; }
+            .table-card__header { align-items: flex-start; flex-direction: column; padding: 16px; }
             .btn-export { font-size: var(--fs-sm); height: 38px; }
             .security-stats { grid-template-columns: 1fr 1fr; }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/sams-shell.css" />
 </head>
 <body>
 
 <div class="sidebar-overlay sidebar-overlay--hidden" id="sidebarOverlay"></div>
 
 <div class="app">
-
-    <!-- ================================================================
-         SIDEBAR
-    ================================================================ -->
-    <aside class="sidebar" id="sidebar" role="navigation" aria-label="Admin navigation">
-
-        <div class="sidebar__header">
-            <div class="sidebar__brand">
-                <div class="sidebar__logo" aria-hidden="true">
-                    <span class="sidebar__logo-text">NU</span>
-                </div>
-                <div class="sidebar__brand-info">
-                    <span class="sidebar__app-name">SA System</span>
-                    <span class="sidebar__app-sub">Admin Panel</span>
-                </div>
-            </div>
-        </div>
-
-        <nav class="sidebar__nav" aria-label="Main menu">
-            <ul class="nav__list">
-                <li class="nav__item">
-                    <a href="dashboard.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <rect x="2" y="2" width="7" height="7" rx="1.5" fill="#364153"/>
-                                <rect x="11" y="2" width="7" height="7" rx="1.5" fill="#364153"/>
-                                <rect x="2" y="11" width="7" height="7" rx="1.5" fill="#364153"/>
-                                <rect x="11" y="11" width="7" height="7" rx="1.5" fill="#364153"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Dashboard</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="application.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M6 2h8a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z" stroke="#364153" stroke-width="1.5"/>
-                                <path d="M7 7h6M7 10h6M7 13h4" stroke="#364153" stroke-width="1.5" stroke-linecap="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Applications</span>
-                        <span class="nav__badge" aria-label="12 pending">12</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="scheduling.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <rect x="2" y="4" width="16" height="14" rx="2" stroke="#364153" stroke-width="1.5"/>
-                                <path d="M6 2v4M14 2v4" stroke="#364153" stroke-width="1.5" stroke-linecap="round"/>
-                                <path d="M2 9h16" stroke="#364153" stroke-width="1.2"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Scheduling</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="attendance.php" class="nav__link nav__link--active" aria-current="page">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <circle cx="10" cy="10" r="8" stroke="white" stroke-width="1.5"/>
-                                <path d="M6.5 10.5l2.5 2.5 4.5-5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Attendance</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="chat.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M4 4h12a2 2 0 012 2v6a2 2 0 01-2 2H9l-4 3v-3H4a2 2 0 01-2-2V6a2 2 0 012-2z" stroke="#364153" stroke-width="1.5" stroke-linejoin="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Messages</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="documents.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M5 2h7l4 4v12a1 1 0 01-1 1H5a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="#364153" stroke-width="1.5"/>
-                                <path d="M12 2v4h4" stroke="#364153" stroke-width="1.5" stroke-linecap="round"/>
-                                <path d="M7 10h6M7 13h4" stroke="#364153" stroke-width="1.5" stroke-linecap="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Documents</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="evaluation.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M10 2l2.09 4.26L17 7.27l-3.5 3.41.83 4.82L10 13.27l-4.33 2.23.83-4.82L3 7.27l4.91-.71L10 2z" stroke="#364153" stroke-width="1.5" stroke-linejoin="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Evaluation</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="reports.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <rect x="3" y="12" width="3" height="6" rx="1" fill="#364153"/>
-                                <rect x="8.5" y="8" width="3" height="10" rx="1" fill="#364153"/>
-                                <rect x="14" y="4" width="3" height="14" rx="1" fill="#364153"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Reports</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="students.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <circle cx="10" cy="7" r="4" stroke="#364153" stroke-width="1.5"/>
-                                <path d="M2 17c0-3.314 3.582-6 8-6s8 2.686 8 6" stroke="#364153" stroke-width="1.5" stroke-linecap="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Students</span>
-                    </a>
-                </li>
-            </ul>
-        </nav>
-
-        <div class="sidebar__footer">
-            <ul class="nav__list">
-                <li class="nav__item">
-                    <a href="settings.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M8.325 2.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37a1.724 1.724 0 002.572-1.065z" stroke="#364153" stroke-width="1.3"/>
-                                <circle cx="10" cy="10" r="3" stroke="#364153" stroke-width="1.3"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Settings</span>
-                    </a>
-                </li>
-                <li class="nav__item">
-                    <a href="logout.php" class="nav__link">
-                        <span class="nav__icon" aria-hidden="true">
-                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M7 3H4a1 1 0 00-1 1v12a1 1 0 001 1h3" stroke="#364153" stroke-width="1.5" stroke-linecap="round"/>
-                                <path d="M13 14l3-4-3-4M16 10H7" stroke="#364153" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                            </svg>
-                        </span>
-                        <span class="nav__label">Sign Out</span>
-                    </a>
-                </li>
-            </ul>
-        </div>
-    </aside>
+    <?php $activeAdminNav = 'attendance'; $pendingApplications = (int) $applicationBadgeCount; include __DIR__ . '/_sidebar.php'; ?>
 
     <!-- ================================================================
          MAIN
@@ -1199,8 +1023,8 @@ if (empty($offices)) {
                 </a>
                 <div class="topbar__user">
                     <div class="topbar__user-info">
-                        <span class="topbar__user-name"><?php echo htmlspecialchars($admin_name); ?></span>
-                        <span class="topbar__user-role"><?php echo htmlspecialchars($admin_role); ?></span>
+                        <span class="topbar__user-name"><?= htmlspecialchars($admin_name, ENT_QUOTES, 'UTF-8') ?></span>
+                        <span class="topbar__user-role">SDAO Head</span>
                     </div>
                     <div class="topbar__avatar" aria-hidden="true">
                         <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -1214,6 +1038,7 @@ if (empty($offices)) {
 
         <!-- Page Content -->
         <section class="page-content" aria-label="Attendance Monitoring content">
+
             <!-- Controls Row -->
             <div class="controls-row">
                 <div class="controls-row__left">
@@ -1235,10 +1060,21 @@ if (empty($offices)) {
                     </div>
                     <!-- Filter -->
                     <select class="filter-select" aria-label="Filter by period" id="filterSelect">
-                        <option value="today" <?php echo $selected_period === 'today' ? 'selected' : ''; ?>>Today</option>
-                        <option value="yesterday" <?php echo $selected_period === 'yesterday' ? 'selected' : ''; ?>>Yesterday</option>
-                        <option value="week" <?php echo $selected_period === 'week' ? 'selected' : ''; ?>>This Week</option>
-                        <option value="month" <?php echo $selected_period === 'month' ? 'selected' : ''; ?>>This Month</option>
+                        <option value="today">Today</option>
+                        <option value="yesterday">Yesterday</option>
+                        <option value="week">This Week</option>
+                        <option value="month">This Month</option>
+                    </select>
+                    <select class="filter-select office-filter" aria-label="Filter by office" id="officeFilter">
+                        <option value="all">All Offices</option>
+                        <?php foreach ($attendanceOfficeOptions as $officeOption): ?>
+                            <option value="<?= htmlspecialchars($officeOption, ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($officeOption, ENT_QUOTES, 'UTF-8') ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <select class="filter-select" aria-label="Filter by scheduled shift" id="scheduleShiftFilter">
+                        <option value="all">All schedules</option>
+                        <option value="morning">Morning</option>
+                        <option value="afternoon">Afternoon</option>
                     </select>
                 </div>
                 <!-- Export -->
@@ -1262,10 +1098,10 @@ if (empty($offices)) {
                                 <path d="M10 6v4l2.5 2.5" stroke="#00A63E" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                         </div>
-                        <span class="stat-card__pct"><?php echo (int) $on_time_pct; ?>%</span>
+                        <span class="stat-card__pct" id="metric-attendance-rate"><?= $attendanceRate ?>%</span>
                     </div>
-                    <div class="stat-card__value"><?php echo (int) $today_present; ?>/<?php echo (int) $today_total; ?></div>
-                    <div class="stat-card__label">On Time Today</div>
+                    <div class="stat-card__value" id="metric-on-time"><?= $verifiedCount ?>/<?= $totalSchedules ?></div>
+                    <div class="stat-card__label">Attendance Recorded</div>
                 </div>
                 <!-- Avg Hours/Day -->
                 <div class="stat-card">
@@ -1275,10 +1111,10 @@ if (empty($offices)) {
                                 <path d="M3 17l4-8 4 5 3-3 3 2" stroke="#155DFC" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                         </div>
-                        <span class="stat-card__pct">Monthly</span>
+                        <span class="stat-card__pct">Live</span>
                     </div>
-                    <div class="stat-card__value"><?php echo number_format($avg_logs_per_day, 1); ?></div>
-                    <div class="stat-card__label">Avg. Logs/Day</div>
+                    <div class="stat-card__value" id="metric-scheduled-shifts"><?= $totalSchedules ?></div>
+                    <div class="stat-card__label">Scheduled Shifts</div>
                 </div>
                 <!-- Active Now -->
                 <div class="stat-card">
@@ -1291,8 +1127,8 @@ if (empty($offices)) {
                         </div>
                         <span class="stat-card__pct">Live</span>
                     </div>
-                    <div class="stat-card__value"><?php echo (int) $active_now; ?></div>
-                    <div class="stat-card__label">Active Now</div>
+                    <div class="stat-card__value" id="metric-active-now">24</div>
+                    <div class="stat-card__label">In Progress</div>
                 </div>
                 <!-- This Month -->
                 <div class="stat-card">
@@ -1304,82 +1140,69 @@ if (empty($offices)) {
                                 <path d="M2 9h16" stroke="#F54900" stroke-width="1.2"/>
                             </svg>
                         </div>
-                        <span class="stat-card__pct"><?php echo date('M Y'); ?></span>
+                        <span class="stat-card__pct">Live</span>
                     </div>
-                    <div class="stat-card__value"><?php echo number_format($month_logs); ?></div>
-                    <div class="stat-card__label">This Month Logs</div>
+                    <div class="stat-card__value" id="metric-total-hours"><?= htmlspecialchars(sams_attendance_format_duration($recordedSeconds), ENT_QUOTES, 'UTF-8') ?></div>
+                    <div class="stat-card__label">Hours Recorded</div>
                 </div>
             </div>
 
             <!-- Attendance Table -->
             <div class="table-card">
                 <div class="table-card__header">
-                    <h2 class="table-card__title">Attendance Log</h2>
-                    <p class="table-card__date"><?php echo htmlspecialchars($periodLabel); ?></p>
+                    <h2 class="table-card__title" id="attendance-table-title">Today's Attendance Log</h2>
+                    <p class="table-card__date" id="attendance-period-label"><?php echo htmlspecialchars($currentDateLabel, ENT_QUOTES, 'UTF-8'); ?></p>
                 </div>
                 <div class="att-table-wrap">
                     <table class="att-table" aria-label="Today's attendance log">
                         <colgroup>
                             <col class="col-sa">
+                            <col class="col-date">
                             <col class="col-office">
                             <col class="col-timein">
                             <col class="col-timeout">
                             <col class="col-duration">
                             <col class="col-method">
                             <col class="col-status">
-                            <col class="col-validation">
                         </colgroup>
                         <thead>
                             <tr>
                                 <th scope="col">Student Assistant</th>
+                                <th scope="col">Date</th>
                                 <th scope="col">Office</th>
                                 <th scope="col">Time In</th>
                                 <th scope="col">Time Out</th>
                                 <th scope="col">Duration</th>
                                 <th scope="col">Method</th>
                                 <th scope="col">Status</th>
-                                <th scope="col">Validation</th>
                             </tr>
                         </thead>
                         <tbody id="attendanceTableBody">
                             <?php if (empty($attendance_rows)): ?>
-                            <tr>
-                                <td colspan="7">No attendance records found for this period.</td>
-                            </tr>
+                            <tr><td class="att-table__empty" colspan="8">No attendance records for today.</td></tr>
                             <?php else: ?>
                             <?php foreach ($attendance_rows as $row): ?>
-                            <tr>
+                            <tr data-schedule-start="<?= htmlspecialchars((string) ($row['schedule_start'] ?? ''), ENT_QUOTES, 'UTF-8') ?>">
                                 <td>
                                     <div class="att-name">
                                         <span class="att-dot att-dot--<?= htmlspecialchars($row['dot']) ?>" aria-hidden="true"></span>
                                         <?= htmlspecialchars($row['name']) ?>
                                     </div>
                                 </td>
-                                <td><?= htmlspecialchars($row['office']) ?></td>
+                                <td class="att-date"><?= htmlspecialchars($row['date_label']) ?></td>
+                                <td class="att-office"><?= htmlspecialchars($row['office']) ?></td>
                                 <td><?= htmlspecialchars($row['time_in']) ?></td>
                                 <td><?= htmlspecialchars($row['time_out']) ?></td>
                                 <td><span class="att-duration"><?= htmlspecialchars($row['duration']) ?></span></td>
                                 <td><span class="att-method"><?= htmlspecialchars($row['method']) ?></span></td>
                                 <td>
-                                    <span class="att-status <?= htmlspecialchars($row['status_class']) ?>"><?= htmlspecialchars($row['status']) ?></span>
-                                </td>
-                                <td>
-                                    <?php if (!$row['is_open']): ?>
-                                        <?php if ($row['validation_status'] === 'pending'): ?>
-                                            <form method="POST" style="display:inline-flex;gap:4px;">
-                                                <input type="hidden" name="action" value="validate_attendance">
-                                                <input type="hidden" name="attendance_id" value="<?= $row['id'] ?>">
-                                                <button type="submit" name="val_status" value="accepted" title="Accept" style="background:#00C950;color:#fff;border-radius:4px;padding:4px 8px;font-size:12px;">✓ Accept</button>
-                                                <button type="submit" name="val_status" value="rejected" title="Reject" style="background:#FB2C36;color:#fff;border-radius:4px;padding:4px 8px;font-size:12px;">✗ Reject</button>
-                                            </form>
-                                        <?php elseif ($row['validation_status'] === 'accepted'): ?>
-                                            <span style="color:#008236;font-size:12px;font-weight:bold;">Accepted</span>
-                                        <?php elseif ($row['validation_status'] === 'rejected'): ?>
-                                            <span style="color:#b42318;font-size:12px;font-weight:bold;">Rejected</span>
-                                        <?php endif; ?>
-                                    <?php else: ?>
-                                        <span style="color:#99A1AF;font-size:12px;">Awaiting Checkout</span>
-                                    <?php endif; ?>
+                                    <?php
+                                    $st = strtolower($row['status']);
+                                    $cls = 'att-status--scheduled';
+                                    if ($st === 'present' || $st === 'completed') $cls = 'att-status--completed';
+                                    elseif ($st === 'late' || $st === 'active' || $st === 'in progress') $cls = 'att-status--active';
+                                    ?>
+                                    <span class="att-status <?= $cls ?>"><?= htmlspecialchars($row['status']) ?></span>
                                 </td>
                             </tr>
                             <?php endforeach; ?>
@@ -1395,15 +1218,15 @@ if (empty($offices)) {
                 <!-- Dual-Layer Security Panel -->
                 <div class="security-panel" role="region" aria-label="Dual-Layer Security">
                     <h2 class="security-panel__title">🔒 Dual-Layer Security</h2>
-                    <p class="security-panel__desc">Attendance integrity metrics based on system logs</p>
+                    <p class="security-panel__desc">All attendance logs verified with QR Code + PIN/OTP validation</p>
                     <div class="security-stats">
                         <div class="security-stat">
-                            <span class="security-stat__value"><?php echo number_format($verified_logs); ?></span>
+                            <span class="security-stat__value" id="security-verified"><?= (int) $verifiedCount ?></span>
                             <span class="security-stat__label">Verified Logs</span>
                         </div>
                         <div class="security-stat">
-                            <span class="security-stat__value"><?php echo (int) $accuracy_pct; ?>%</span>
-                            <span class="security-stat__label">Accuracy</span>
+                            <span class="security-stat__value" id="security-accuracy"><?= $attendanceRate ?>%</span>
+                            <span class="security-stat__label">Attendance Rate</span>
                         </div>
                     </div>
                 </div>
@@ -1411,19 +1234,19 @@ if (empty($offices)) {
                 <!-- Office Distribution Panel -->
                 <div class="dist-panel" role="region" aria-label="Office Distribution">
                     <h2 class="dist-panel__title">Office Distribution</h2>
-                    <div class="office-bars">
-                        <?php foreach ($offices as $office): ?>
-                        <div class="office-bar">
-                            <div class="office-bar__header">
-                                <span class="office-bar__name"><?= htmlspecialchars($office['name']) ?></span>
-                                <span class="office-bar__count"><?= (int)$office['count'] ?> SAs</span>
+                            <div class="office-bars" id="officeBars">
+                                <?php foreach ($offices as $office): ?>
+                                <div class="office-bar">
+                                    <div class="office-bar__header">
+                                        <span class="office-bar__name"><?= htmlspecialchars($office['name']) ?></span>
+                                        <span class="office-bar__count"><?= (int)$office['count'] ?> SAs</span>
+                                    </div>
+                                    <div class="office-bar__track" role="progressbar" aria-valuenow="<?= (int)$office['pct'] ?>" aria-valuemin="0" aria-valuemax="100" aria-label="<?= htmlspecialchars($office['name']) ?> distribution">
+                                        <div class="office-bar__fill office-bar__fill--<?= htmlspecialchars($office['color']) ?>" style="width:<?= (int)$office['pct'] ?>%"></div>
+                                    </div>
+                                </div>
+                                <?php endforeach; ?>
                             </div>
-                            <div class="office-bar__track" role="progressbar" aria-valuenow="<?= (int)$office['pct'] ?>" aria-valuemin="0" aria-valuemax="100" aria-label="<?= htmlspecialchars($office['name']) ?> distribution">
-                                <div class="office-bar__fill office-bar__fill--<?= htmlspecialchars($office['color']) ?>" style="width:<?= (int)$office['pct'] ?>%"></div>
-                            </div>
-                        </div>
-                        <?php endforeach; ?>
-                    </div>
                 </div>
 
             </div>
@@ -1471,30 +1294,223 @@ if (empty($offices)) {
     /* ---- Live search filter ---- */
     var searchInput = document.getElementById('searchInput');
     var tableBody   = document.getElementById('attendanceTableBody');
-    var filterSelect = document.getElementById('filterSelect');
+    var shiftFilter = document.getElementById('scheduleShiftFilter');
 
-    if (filterSelect) {
-        filterSelect.addEventListener('change', function () {
-            var url = new URL(window.location.href);
-            url.searchParams.set('period', filterSelect.value || 'today');
-            window.location.href = url.toString();
+    function schedulePeriod(startTime) {
+        var match = String(startTime || '').trim().match(/^(\d{1,2}):\d{2}(?::\d{2})?\s*(AM|PM)?$/i);
+        if (!match) return 'unknown';
+
+        var hour = parseInt(match[1], 10);
+        var meridiem = (match[2] || '').toUpperCase();
+        if (meridiem === 'PM' && hour < 12) hour += 12;
+        if (meridiem === 'AM' && hour === 12) hour = 0;
+        return hour < 12 ? 'morning' : 'afternoon';
+    }
+
+    function applyAttendanceFilters() {
+        if (!tableBody) return;
+
+        var query = searchInput ? searchInput.value.trim().toLowerCase() : '';
+        var selectedShift = shiftFilter ? shiftFilter.value : 'all';
+        var rows = Array.prototype.slice.call(tableBody.querySelectorAll('tr'));
+        var dataRows = rows.filter(function (row) { return !row.querySelector('td[colspan]'); });
+        var visibleCount = 0;
+
+        tableBody.querySelectorAll('[data-filter-empty]').forEach(function (row) { row.remove(); });
+        dataRows.forEach(function (row) {
+            var name = row.querySelector('.att-name');
+            var matchesSearch = !query || (name && name.textContent.toLowerCase().indexOf(query) !== -1);
+            var matchesShift = selectedShift === 'all' || schedulePeriod(row.getAttribute('data-schedule-start')) === selectedShift;
+            row.style.display = matchesSearch && matchesShift ? '' : 'none';
+            if (matchesSearch && matchesShift) visibleCount++;
         });
+
+        if (dataRows.length > 0 && visibleCount === 0) {
+            var emptyRow = document.createElement('tr');
+            emptyRow.setAttribute('data-filter-empty', 'true');
+            var emptyCell = document.createElement('td');
+            emptyCell.colSpan = 8;
+            emptyCell.textContent = 'No schedules match this shift and search.';
+            emptyRow.appendChild(emptyCell);
+            tableBody.appendChild(emptyRow);
+        }
     }
 
     if (searchInput && tableBody) {
         searchInput.addEventListener('input', function () {
-            var q = this.value.trim().toLowerCase();
-            var rows = tableBody.querySelectorAll('tr');
-            rows.forEach(function (row) {
-                var name = row.querySelector('.att-name');
-                var text = name ? name.textContent.toLowerCase() : '';
-                row.style.display = (!q || text.indexOf(q) !== -1) ? '' : 'none';
-            });
+            applyAttendanceFilters();
         });
+    }
+    if (shiftFilter) shiftFilter.addEventListener('change', applyAttendanceFilters);
+    window.applyAttendanceFilters = applyAttendanceFilters;
+
+})();
+</script>
+
+<script>
+// Poll attendance_data.php every 5 seconds and update UI
+(function () {
+    'use strict';
+
+    var endpoint = 'attendance_data.php';
+    var tableBody = document.getElementById('attendanceTableBody');
+    var metricOnTime = document.getElementById('metric-on-time');
+    var metricAttendanceRate = document.getElementById('metric-attendance-rate');
+    var metricScheduledShifts = document.getElementById('metric-scheduled-shifts');
+    var metricActive = document.getElementById('metric-active-now');
+    var metricTotalHours = document.getElementById('metric-total-hours');
+    var officeBars = document.getElementById('officeBars');
+    var securityVerified = document.getElementById('security-verified');
+    var securityAccuracy = document.getElementById('security-accuracy');
+    var periodFilter = document.getElementById('filterSelect');
+    var officeFilter = document.getElementById('officeFilter');
+    var tableTitle = document.getElementById('attendance-table-title');
+    var periodLabel = document.getElementById('attendance-period-label');
+
+    function dotClassForStatus(st) {
+        st = (st || '').toLowerCase();
+        if (st === 'completed' || st === 'present') return 'att-dot--green';
+        if (st === 'active' || st === 'late' || st === 'in progress') return 'att-dot--blue';
+        return 'att-dot--grey';
+    }
+
+    function renderRow(r) {
+        var name = (r.first_name || '') + ' ' + (r.last_name || '');
+        var office = r.office_name || '-';
+        var timeIn = r.time_in || '-';
+        var timeOut = r.time_out || (r.time_in ? 'In Progress' : '-');
+        var scheduleStart = r.start_time || r.schedule_start || '';
+        var status = r.status || 'Scheduled';
+        var dotCls = dotClassForStatus(status);
+
+        var statusCls = 'att-status--scheduled';
+        if ((status || '').toLowerCase() === 'completed') statusCls = 'att-status--completed';
+        else if ((status || '').toLowerCase() === 'active' || (status || '').toLowerCase() === 'late' || (status || '').toLowerCase() === 'in progress') statusCls = 'att-status--active';
+
+        var html = '<tr data-schedule-start="' + escapeHtml(scheduleStart) + '">' +
+            '<td><div class="att-name"><span class="att-dot ' + dotCls + '" aria-hidden="true"></span>' + escapeHtml(name) + '</div></td>' +
+            '<td class="att-date">' + escapeHtml(r.date_label || '-') + '</td>' +
+            '<td class="att-office">' + escapeHtml(office) + '</td>' +
+            '<td>' + escapeHtml(timeIn) + '</td>' +
+            '<td>' + escapeHtml(timeOut) + '</td>' +
+            '<td><span class="att-duration">' + escapeHtml(r.duration || '-') + '</span></td>' +
+            '<td><span class="att-method">' + escapeHtml(r.method || '-') + '</span></td>' +
+            '<td><span class="att-status ' + statusCls + '">' + escapeHtml(status) + '</span></td>' +
+            '</tr>';
+        return html;
+    }
+
+    function escapeHtml(s) {
+        if (s === null || s === undefined) return '';
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function updateOfficeBars(offices) {
+        if (!officeBars) return;
+        officeBars.innerHTML = '';
+        if (!Array.isArray(offices) || offices.length === 0) {
+            officeBars.innerHTML = '<p style="color:var(--clr-text-muted);font-size:var(--fs-sm);">No office attendance in this period.</p>';
+            return;
+        }
+        offices.forEach(function (o) {
+            var name = o.office_name || o.name || '-';
+            var total = o.total || o.count || 0;
+            var pct = parseInt(o.pct || 0, 10) || 0;
+            var fillColor = 'office-bar__fill--blue';
+            var color = (o.color || '').toLowerCase();
+            if (color === 'green') fillColor = 'office-bar__fill--green';
+            else if (color === 'purple') fillColor = 'office-bar__fill--purple';
+            else if (color === 'orange') fillColor = 'office-bar__fill--orange';
+            else if (color === 'grey') fillColor = 'office-bar__fill--grey';
+
+            var node = document.createElement('div');
+            node.className = 'office-bar';
+            node.innerHTML = '<div class="office-bar__header"><span class="office-bar__name">' + escapeHtml(name) + '</span><span class="office-bar__count">' + (total) + ' SAs</span></div>' +
+                '<div class="office-bar__track" role="progressbar" aria-valuenow="' + (pct) + '" aria-valuemin="0" aria-valuemax="100" aria-label="' + escapeHtml(name) + ' distribution">' +
+                '<div class="office-bar__fill ' + fillColor + '" style="width:' + (pct) + '%"></div></div>';
+            officeBars.appendChild(node);
+        });
+    }
+
+    function poll() {
+        var selectedPeriod = periodFilter ? periodFilter.value : 'today';
+        var selectedOffice = officeFilter ? officeFilter.value : 'all';
+        var url = endpoint + '?period=' + encodeURIComponent(selectedPeriod) +
+            '&office=' + encodeURIComponent(selectedOffice) + '&t=' + Date.now();
+        fetch(url, { credentials: 'same-origin' }).then(function (r) {
+            if (!r.ok) throw new Error('Network response not ok');
+            return r.json();
+        }).then(function (data) {
+            if (!data || !data.success) return;
+
+            // Update metrics
+            try {
+                var metrics = data.metrics || {};
+                var recordedCount = Number(metrics.recorded_count || 0);
+                var totalSchedules = Number(metrics.total_schedules || 0);
+
+                if (metricActive) metricActive.textContent = String(metrics.active_now || 0);
+                if (metricOnTime) metricOnTime.textContent = recordedCount + '/' + totalSchedules;
+                if (metricAttendanceRate) metricAttendanceRate.textContent = String(metrics.attendance_rate || 0) + '%';
+                if (metricScheduledShifts) metricScheduledShifts.textContent = String(totalSchedules);
+                if (metricTotalHours) metricTotalHours.textContent = metrics.total_hours || '0 min';
+                if (tableTitle && periodFilter) {
+                    var periodTitles = { today: "Today's Attendance Log", yesterday: "Yesterday's Attendance Log", week: "This Week's Attendance Log", month: "This Month's Attendance Log" };
+                    tableTitle.textContent = periodTitles[selectedPeriod] || 'Attendance Log';
+                }
+                if (periodLabel) periodLabel.textContent = data.period_label || '';
+
+                // Table rows
+                if (tableBody && Array.isArray(data.today_rows)) {
+                    var rowsHtml = data.today_rows.map(renderRow).join('');
+                    tableBody.innerHTML = rowsHtml || '<tr><td class="att-table__empty" colspan="8">No attendance records for this period and office.</td></tr>';
+                    if (window.applyAttendanceFilters) window.applyAttendanceFilters();
+                }
+
+                // Offices
+                if (Array.isArray(data.offices)) updateOfficeBars(data.offices);
+
+                // Security
+                if (securityVerified && data.security) securityVerified.textContent = String(data.security.verified || '0');
+                if (securityAccuracy && data.security) securityAccuracy.textContent = String(data.security.accuracy || 0) + '%';
+            } catch (err) {
+                console.error('Update error', err);
+            }
+        }).catch(function (err) {
+            console.warn('Attendance poll failed', err);
+        });
+    }
+
+    // Start polling
+    // Start polling
+    poll();
+    setInterval(poll, 5000);
+    if (periodFilter) periodFilter.addEventListener('change', poll);
+    if (officeFilter) officeFilter.addEventListener('change', poll);
+
+    // SSE stream: prefer push updates for Live UI
+    if (window.EventSource) {
+        try {
+            var adminES = new EventSource('../api/attendance_stream.php');
+            adminES.addEventListener('attendance', function (e) {
+                try {
+                    var payload = JSON.parse(e.data);
+                    if (!payload || !payload.success) return;
+                    poll();
+                } catch (err) {
+                    console.error('SSE admin parse error', err);
+                }
+            });
+            adminES.addEventListener('error', function () { try { adminES.close(); } catch (e) {} });
+        } catch (ex) {
+            console.error('Admin SSE setup failed:', ex);
+        }
     }
 
 })();
 </script>
+
+<script src="../assets/js/admin-notifications.js?v=20260922"></script>
 
 </body>
 </html>

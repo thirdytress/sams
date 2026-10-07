@@ -1,75 +1,137 @@
 <?php
-// login.php – NU SAMS Login Page
-// Student Assistant Management System | National University – Lipa
+declare(strict_types=1);
 
-session_start();
-require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/config/bootstrap.php';
+require_once __DIR__ . '/config/mail.php';
 
-$has_status_column = false;
-if ($colRes = $mysqli->query("SHOW COLUMNS FROM student_applications LIKE 'application_status'")) {
-  $has_status_column = $colRes->num_rows > 0;
-  $colRes->free();
+$currentUser = sams_authenticated_user();
+if ($currentUser) {
+  header('Location: ' . sams_dashboard_for_role($currentUser['role']));
+  exit;
 }
 
-// PHP: handle form submission
-$error   = '';
+$error = '';
 $success = '';
+$showOtpModal = false;
+$identifier = trim($_POST['identifier'] ?? '');
+
+function sams_login_pending_student_otp(): ?array
+{
+  $pending = $_SESSION['sams_pending_student_login'] ?? null;
+  return is_array($pending) ? $pending : null;
+}
+
+function sams_send_student_otp_from_user(array $user): void
+{
+  $otpCode = (string) random_int(100000, 999999);
+  $_SESSION['sams_pending_student_login'] = [
+    'user' => [
+      'id' => (int) $user['id'],
+      'email' => (string) $user['email'],
+      'role' => (string) $user['role'],
+      'first_name' => (string) ($user['first_name'] ?? ''),
+      'last_name' => (string) ($user['last_name'] ?? ''),
+      'student_id' => (string) ($user['student_id'] ?? ''),
+      'must_change_password' => (int) ($user['must_change_password'] ?? 0),
+    ],
+    'otp_hash' => password_hash($otpCode, PASSWORD_DEFAULT),
+    'expires_at' => time() + 600,
+    'created_at' => time(),
+  ];
+
+  sams_send_otp_email(
+    (string) $user['email'],
+    trim((string) ($user['first_name'] ?? '') . ' ' . (string) ($user['last_name'] ?? '')),
+    $otpCode
+  );
+}
+
+function sams_finish_student_login(array $pendingUser): void
+{
+  unset($_SESSION['sams_pending_student_login']);
+  sams_login($pendingUser);
+
+  if ((int) ($pendingUser['must_change_password'] ?? 0) === 1) {
+    header('Location: change_password.php');
+    exit;
+  }
+
+  header('Location: ' . sams_dashboard_for_role('student'));
+  exit;
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-  $student_id = trim($_POST['student_id'] ?? '');
-  $password   = trim($_POST['password']   ?? '');
+  $action = (string) ($_POST['action'] ?? 'login');
 
-  if ($student_id === '' || $password === '') {
-    $error = 'Please fill in all fields.';
-  } else {
-    // First: check if this is the hard-coded admin account
-    if ($student_id === 'Admin' && $password === 'Admin123') {
-      // Admin login (shared login page)
-      $_SESSION['admin_id']   = 1;
-      $_SESSION['admin_name'] = 'Admin';
-      $_SESSION['admin_role'] = 'SDAO Head';
-      $_SESSION['department'] = 'NU Lipa - Student Development and Activities Office';
+  if ($action === 'cancel_otp') {
+    unset($_SESSION['sams_pending_student_login']);
+    header('Location: login.php');
+    exit;
+  }
 
-      header('Location: admin/dashboard.php');
-      exit;
+  if ($action === 'verify_otp') {
+    $pending = sams_login_pending_student_otp();
+    $otp = preg_replace('/\D+/', '', trim((string) ($_POST['otp'] ?? '')));
+
+    if (!$pending || empty($pending['user']) || empty($pending['otp_hash']) || empty($pending['expires_at'])) {
+      $error = 'Your OTP session expired. Please log in again.';
+    } elseif ($otp === '') {
+      $error = 'Please enter the OTP code.';
+      $showOtpModal = true;
+    } elseif ((int) $pending['expires_at'] < time()) {
+      $error = 'OTP expired. Please resend a new code.';
+      $showOtpModal = true;
+    } elseif (!password_verify($otp, (string) $pending['otp_hash'])) {
+      $error = 'Invalid OTP. Please try again.';
+      $showOtpModal = true;
+    } else {
+      sams_finish_student_login($pending['user']);
     }
+  }
 
-    // Otherwise, treat as student login
-    $statusSelect = $has_status_column ? ', application_status' : '';
-    $stmt = $mysqli->prepare("SELECT full_name, student_id, password_hash{$statusSelect} FROM student_applications WHERE student_id = ? ORDER BY created_at DESC LIMIT 1");
+  if ($action === 'resend_otp') {
+    $pending = sams_login_pending_student_otp();
+    if (!$pending || empty($pending['user'])) {
+      $error = 'Your OTP session expired. Please log in again.';
+    } else {
+      try {
+        sams_send_student_otp_from_user($pending['user']);
+        $success = 'A new OTP has been sent to your email.';
+        $showOtpModal = true;
+      } catch (Throwable $exception) {
+        $error = $exception->getMessage();
+        $showOtpModal = true;
+      }
+    }
+  }
 
-    if ($stmt) {
-      $stmt->bind_param('s', $student_id);
-      $stmt->execute();
-      $result = $stmt->get_result();
+  if ($action === 'login') {
+    $password = trim($_POST['password'] ?? '');
 
-      if ($row = $result->fetch_assoc()) {
-        if (!empty($row['password_hash']) && password_verify($password, $row['password_hash'])) {
-          $application_status = strtolower(trim((string) ($row['application_status'] ?? 'pending')));
+    if ($identifier === '' || $password === '') {
+      $error = 'Please fill in all fields.';
+    } else {
+      try {
+        $user = sams_authenticate($identifier, $password);
 
-          if ($application_status === 'approved') {
-            // Successful student login for approved applicants
-            $_SESSION['student_id']   = $row['student_id'];
-            $_SESSION['student_name'] = $row['full_name'];
+        if (($user['role'] ?? null) === 'student') {
+          sams_send_student_otp_from_user($user);
+          $success = 'We sent a one-time password to your email. Enter it below to continue.';
+          $showOtpModal = true;
+        } else {
+          sams_login($user);
 
-            header('Location: student/dashboard.php');
+          if ((int) ($user['must_change_password'] ?? 0) === 1) {
+            header('Location: change_password.php');
             exit;
           }
 
-          // Not yet approved: send student to status page only.
-          unset($_SESSION['student_id'], $_SESSION['student_name']);
-          header('Location: status.php?student_id=' . urlencode((string) $row['student_id']));
+          header('Location: ' . sams_dashboard_for_role($user['role']));
           exit;
-        } else {
-          $error = 'Invalid credentials. Please try again.';
         }
-      } else {
-        $error = 'Account not found. Please register first.';
+      } catch (Throwable $exception) {
+        $error = $exception->getMessage();
       }
-
-      $stmt->close();
-    } else {
-      $error = 'Database error. Please try again later.';
     }
   }
 }
@@ -84,6 +146,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="assets/css/sams-design-system.css" />
   <style>
     /* =============================================
        CSS VARIABLES / DESIGN TOKENS
@@ -217,8 +280,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       flex-shrink: 0;
     }
     .brand-card__title {
+      font-family: var(--font-display, 'Poppins', sans-serif);
       font-size: var(--font-3xl);
-      font-weight: 900;
+      font-weight: 800;
       color: var(--color-white);
       line-height: 1.2;
     }
@@ -231,8 +295,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     /* Heading & paragraph */
     .brand-card__heading {
+      font-family: var(--font-display, 'Poppins', sans-serif);
       font-size: var(--font-4xl);
-      font-weight: 900;
+      font-weight: 800;
       color: var(--color-white);
       line-height: 1.25;
       margin-bottom: var(--space-4);
@@ -302,10 +367,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     /* Card heading */
     .login-card__heading {
+      font-family: var(--font-display, 'Poppins', sans-serif);
       font-size: var(--font-4xl);
-      font-weight: 900;
+      font-weight: 800;
       color: var(--color-dark);
-      line-height: 1.11;
+      line-height: 1.15;
       margin-bottom: var(--space-2);
     }
     .login-card__tagline {
@@ -441,10 +507,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       line-height: 1;
     }
     .login-form__submit:hover { opacity: .88; }
-    .login-form__submit img {
+    .login-form__submit img,
+    .login-form__submit svg {
       width: 24px;
       height: 24px;
       flex-shrink: 0;
+      display: block;
     }
 
     /* Footer links below form */
@@ -473,6 +541,125 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       transition: color .2s;
     }
     .login-card__back a:hover { color: var(--color-primary); }
+
+    /* =============================================
+       OTP MODAL
+    ============================================= */
+    .otp-modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(16, 24, 40, .55);
+      backdrop-filter: blur(6px);
+      z-index: 9999;
+    }
+    .otp-modal--visible { display: flex; }
+    .otp-modal__card {
+      width: min(100%, 520px);
+      background: #fff;
+      border-radius: 24px;
+      border: 1px solid #e5e7eb;
+      box-shadow: 0 24px 60px rgba(0,0,0,.22);
+      overflow: hidden;
+    }
+    .otp-modal__header {
+      padding: 24px 24px 0;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .otp-modal__title {
+      font-family: var(--font-display, 'Poppins', sans-serif);
+      margin: 0 0 8px;
+      font-size: 26px;
+      line-height: 1.2;
+      font-weight: 700;
+      color: var(--color-dark);
+    }
+    .otp-modal__subtitle {
+      margin: 0;
+      color: var(--color-muted);
+      line-height: 1.6;
+    }
+    .otp-modal__close {
+      width: 40px;
+      height: 40px;
+      border-radius: 9999px;
+      background: #f3f4f6;
+      color: #374151;
+      font-size: 20px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .otp-modal__body { padding: 24px; }
+    .otp-modal__meta {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      padding: 14px;
+      border: 1px solid #e5e7eb;
+      border-radius: 16px;
+      background: #f8fafc;
+      margin-bottom: 18px;
+      color: #4a5565;
+      font-size: 14px;
+    }
+    .otp-modal__meta strong { color: var(--color-dark); }
+    .otp-modal__otp {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin: 10px 0 20px;
+      width: 100%;
+    }
+    .otp-modal__otp input {
+      width: 100%;
+      max-width: 100%;
+      height: 84px;
+      border: 2px solid #d1d5dc;
+      border-radius: 18px;
+      text-align: center;
+      font-size: 36px;
+      font-weight: 900;
+      letter-spacing: .12em;
+      outline: none;
+      box-sizing: border-box;
+    }
+    .otp-modal__otp input:focus {
+      border-color: var(--color-primary);
+      box-shadow: 0 0 0 3px rgba(0,48,135,.12);
+    }
+    .otp-modal__actions {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .otp-modal__btn {
+      height: 52px;
+      border-radius: 14px;
+      border: none;
+      font-size: 16px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+    .otp-modal__btn--primary {
+      background: var(--grad-primary);
+      color: #fff;
+    }
+    .otp-modal__btn--secondary {
+      background: #f3f4f6;
+      color: #374151;
+    }
+    .otp-modal__hint {
+      margin-top: 16px;
+      font-size: 14px;
+      color: var(--color-muted);
+      text-align: center;
+    }
 
     /* =============================================
        RESPONSIVE – TABLET (≤1024px)
@@ -528,7 +715,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <h1 class="brand-card__heading">Welcome Back! 👋</h1>
 
         <!-- Description -->
-        <p class="brand-card__desc">Login to access your dashboard, view schedules, and manage your duties at SDAO.</p>
+        <p class="brand-card__desc">Login to access your dashboard, view schedules, and manage your duties at SDAO. Student logins now require email OTP verification.</p>
 
         <!-- Features -->
         <div class="brand-card__features">
@@ -544,8 +731,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           <div class="brand-card__feature">
             <div class="brand-card__feature-icon" aria-hidden="true">📷</div>
             <div>
-              <div class="brand-card__feature-title">Quick Attendance</div>
-              <div class="brand-card__feature-sub">Check in/out with QR code and PIN</div>
+              <div class="brand-card__feature-title">OTP Protected Login</div>
+              <div class="brand-card__feature-sub">Student accounts verify login through email before access is granted</div>
             </div>
           </div>
 
@@ -566,7 +753,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <section class="login-card" aria-labelledby="login-heading">
 
         <h2 class="login-card__heading" id="login-heading">Login</h2>
-        <p class="login-card__tagline">Enter your credentials to access SAMS</p>
+          <p class="login-card__tagline">Enter your email to access SAMS</p>
 
         <?php if ($error): ?>
           <div class="login-card__alert" role="alert"><?php echo htmlspecialchars($error); ?></div>
@@ -574,17 +761,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         <form class="login-form" method="POST" action="" novalidate>
 
-          <!-- Student ID -->
+          <!-- Email -->
           <div class="login-form__group">
-            <label class="login-form__label" for="student_id">Student ID / Username</label>
+            <label class="login-form__label" for="identifier">Email</label>
             <input
               class="login-form__input"
               type="text"
-              id="student_id"
-              name="student_id"
-              placeholder="2021-12345"
+              id="identifier"
+              name="identifier"
+              placeholder="student@nu-lipa.edu.ph"
               autocomplete="username"
-              value="<?php echo htmlspecialchars($_POST['student_id'] ?? ''); ?>"
+              value="<?php echo htmlspecialchars($identifier); ?>"
               required
             />
           </div>
@@ -598,7 +785,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 type="password"
                 id="password"
                 name="password"
-                placeholder="student123"
+                placeholder="password"
                 autocomplete="current-password"
                 required
               />
@@ -627,16 +814,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               <input type="checkbox" name="remember" id="remember" <?php echo isset($_POST['remember']) ? 'checked' : ''; ?> />
               <span class="login-form__remember-text">Remember me</span>
             </label>
-            <a class="login-form__forgot" href="#">Forgot Password?</a>
+            <a class="login-form__forgot" href="forgot_password.php">Forgot Password?</a>
           </div>
 
           <!-- Submit -->
           <button class="login-form__submit" type="submit">
-            <img
-              src="https://www.figma.com/api/mcp/asset/c5624380-e6ad-4e87-ae39-38852df4717f"
-              alt=""
-              aria-hidden="true"
-            />
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12h15m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
             Login
           </button>
 
@@ -644,7 +827,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         <!-- Register link -->
         <p class="login-card__register">
-          Don't have an account? <a href="register.php">Register as Student Assistant</a>
+          Don't have an account? <a href="register.php">Apply as Student Assistant</a>
         </p>
 
         <!-- Back to home -->
@@ -656,6 +839,61 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     </div>
   </main>
+
+  <?php $pendingOtp = sams_login_pending_student_otp(); ?>
+  <div class="otp-modal <?php echo ($showOtpModal || $pendingOtp) ? 'otp-modal--visible' : ''; ?>" id="otpModal" aria-hidden="<?php echo ($showOtpModal || $pendingOtp) ? 'false' : 'true'; ?>">
+    <div class="otp-modal__card" role="dialog" aria-modal="true" aria-labelledby="otp-modal-title">
+      <div class="otp-modal__header">
+        <div>
+          <h2 class="otp-modal__title" id="otp-modal-title">Verify your login</h2>
+          <p class="otp-modal__subtitle">Enter the 6-digit code we sent to your student email to complete sign-in.</p>
+        </div>
+        <form method="POST" style="margin:0;">
+          <input type="hidden" name="action" value="cancel_otp" />
+          <button type="submit" class="otp-modal__close" id="otpModalClose" aria-label="Close OTP modal">×</button>
+        </form>
+      </div>
+
+      <div class="otp-modal__body">
+        <?php if ($error): ?>
+          <div class="login-card__alert" role="alert"><?php echo htmlspecialchars($error); ?></div>
+        <?php endif; ?>
+        <?php if ($success): ?>
+          <div class="login-card__alert" style="background:#ecfdf5;border-color:#a7f3d0;color:#047857;" role="status"><?php echo htmlspecialchars($success); ?></div>
+        <?php endif; ?>
+
+        <div class="otp-modal__meta">
+          <div><span>Email</span><br><strong><?php echo htmlspecialchars((string) ($pendingOtp['user']['email'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></strong></div>
+          <div><span>Expires in</span><br><strong><?php echo $pendingOtp ? (int) ceil(max(0, ((int) ($pendingOtp['expires_at'] ?? time())) - time()) / 60) : 0; ?> min</strong></div>
+        </div>
+
+        <form method="POST" autocomplete="off">
+          <input type="hidden" name="action" value="verify_otp" />
+          <div class="otp-modal__otp" id="otpSlots">
+            <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1" class="otp-slot" aria-label="Digit 1" autocomplete="one-time-code" />
+            <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1" class="otp-slot" aria-label="Digit 2" />
+            <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1" class="otp-slot" aria-label="Digit 3" />
+            <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1" class="otp-slot" aria-label="Digit 4" />
+            <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1" class="otp-slot" aria-label="Digit 5" />
+            <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1" class="otp-slot" aria-label="Digit 6" />
+            <input type="hidden" name="otp" id="otpHidden" />
+          </div>
+          <div class="otp-modal__actions">
+            <button class="otp-modal__btn otp-modal__btn--primary" type="submit">Verify OTP</button>
+          </div>
+        </form>
+
+        <form method="POST" style="margin-top:12px;">
+          <input type="hidden" name="action" value="resend_otp" />
+          <div class="otp-modal__actions">
+            <button class="otp-modal__btn otp-modal__btn--secondary" type="submit">Resend OTP</button>
+          </div>
+        </form>
+
+        <div class="otp-modal__hint">You can close this modal and log in again if needed.</div>
+      </div>
+    </div>
+  </div>
 
   <script>
     (function () {
@@ -676,51 +914,127 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           toggleBtn.setAttribute('aria-label', isPassword ? 'Hide password' : 'Show password');
         });
       }
-    })();
-  </script>
 
-  <script>
-    (function () {
-      'use strict';
+      /* ---- Dynamic Student ID Password Label Check ---- */
+      var identifierInput = document.getElementById('identifier');
+      var passwordLabel = document.querySelector('label[for="password"]');
 
-      var iconSvgs = {
-        'default': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="18" height="18" rx="4" fill="#EAF2FF"/><path d="M8 8h8v8H8z" stroke="#155DFC" stroke-width="1.8"/><path d="M7 16l3.5-3.5 2.5 2.5L15.5 12 17 13.5" stroke="#155DFC" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-        'next': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M9.5 6.5L15 12l-5.5 5.5" stroke="#155DFC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-        'back': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M14.5 6.5L9 12l5.5 5.5" stroke="#155DFC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-        'lock': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect x="6" y="11" width="12" height="9" rx="2" stroke="#155DFC" stroke-width="1.8"/><path d="M8.5 11V8a3.5 3.5 0 117 0v3" stroke="#155DFC" stroke-width="1.8"/></svg>'
-      };
+      if (identifierInput && passwordLabel && pwInput) {
+        var lastCheckedVal = '';
+        var checkTimeout = null;
 
-      function fallbackSrcFor(key) {
-        var svg = iconSvgs[key] || iconSvgs.default;
-        return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg);
-      }
+        function checkFirstLoginStatus() {
+          var val = identifierInput.value.trim();
+          if (val === lastCheckedVal) return;
+          lastCheckedVal = val;
 
-      function iconKeyFor(img) {
-        var cls = String(img.className || '').toLowerCase();
-        var alt = String(img.getAttribute('alt') || '').toLowerCase();
-        var text = String((img.closest('a,button,li,div') || {}).textContent || '').toLowerCase();
-        var hint = cls + ' ' + alt + ' ' + text;
+          if (val === '') {
+            passwordLabel.textContent = 'Password';
+            pwInput.placeholder = 'password';
+            return;
+          }
 
-        if (hint.indexOf('back') !== -1 || hint.indexOf('home') !== -1) return 'back';
-        if (hint.indexOf('login') !== -1 || hint.indexOf('submit') !== -1) return 'next';
-        if (hint.indexOf('password') !== -1 || hint.indexOf('lock') !== -1) return 'lock';
-        return 'default';
-      }
-
-      function setFallback(img) {
-        if (!img || img.getAttribute('data-icon-fallback') === '1') {
-          return;
+          fetch('check_first_login.php?identifier=' + encodeURIComponent(val))
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+              if (d && d.is_first_login) {
+                passwordLabel.textContent = 'Student ID';
+                pwInput.placeholder = 'Enter Student ID';
+              } else {
+                passwordLabel.textContent = 'Password';
+                pwInput.placeholder = 'password';
+              }
+            })
+            .catch(function() {
+              passwordLabel.textContent = 'Password';
+              pwInput.placeholder = 'password';
+            });
         }
-        img.setAttribute('data-icon-fallback', '1');
-        img.src = fallbackSrcFor(iconKeyFor(img));
+
+        identifierInput.addEventListener('blur', checkFirstLoginStatus);
+
+        identifierInput.addEventListener('input', function() {
+          clearTimeout(checkTimeout);
+          checkTimeout = setTimeout(checkFirstLoginStatus, 500);
+        });
+
+        // Run once on load to handle autofill or remembered values
+        setTimeout(checkFirstLoginStatus, 300);
       }
 
-      document.querySelectorAll('img[src*="figma.com/api/mcp/asset"]').forEach(function (img) {
-        img.addEventListener('error', function () { setFallback(img); }, { once: true });
-        if (img.complete && img.naturalWidth === 0) {
-          setFallback(img);
+      // ---- OTP 6-slot logic ----
+      var otpSlots = document.querySelectorAll('.otp-slot');
+      var otpHidden = document.getElementById('otpHidden');
+      if (otpSlots.length === 6 && otpHidden) {
+        otpSlots[0].focus();
+        otpSlots.forEach(function(input, idx) {
+          input.addEventListener('input', function(e) {
+            var v = input.value.replace(/\D/g, '');
+            if (v.length > 1) {
+              v.split('').slice(0, 6).forEach(function(digit, digitIdx) {
+                if (otpSlots[idx + digitIdx]) otpSlots[idx + digitIdx].value = digit;
+              });
+              updateOtpHidden();
+              if (otpSlots[Math.min(idx + v.length, 5)]) otpSlots[Math.min(idx + v.length, 5)].focus();
+              return;
+            }
+            input.value = v;
+            if (v && idx < 5) otpSlots[idx+1].focus();
+            updateOtpHidden();
+          });
+          input.addEventListener('keydown', function(e) {
+            if (e.key === 'Backspace' && !input.value && idx > 0) {
+              otpSlots[idx-1].focus();
+            }
+          });
+        });
+        function updateOtpHidden() {
+          var code = Array.from(otpSlots).map(function(i){return i.value;}).join('');
+          otpHidden.value = code;
         }
-      });
+        // On form submit, combine digits
+        var otpForm = otpHidden.closest('form');
+        if (otpForm) {
+          otpForm.addEventListener('submit', function() {
+            updateOtpHidden();
+          });
+        }
+      }
+
+      var otpModal = document.getElementById('otpModal');
+      var otpClose = document.getElementById('otpModalClose');
+      var otpInput = otpModal ? otpModal.querySelector('input[name="otp"]') : null;
+
+      function openOtpModal() {
+        if (!otpModal) return;
+        otpModal.classList.add('otp-modal--visible');
+        otpModal.setAttribute('aria-hidden', 'false');
+        document.body.style.overflow = 'hidden';
+        if (otpInput) {
+          otpInput.focus();
+        }
+      }
+
+      function closeOtpModal() {
+        if (!otpModal) return;
+        var cancelForm = otpClose ? otpClose.closest('form') : null;
+        if (cancelForm) {
+          cancelForm.submit();
+        }
+      }
+
+      if (otpModal && otpClose) {
+        otpClose.addEventListener('click', closeOtpModal);
+        otpModal.addEventListener('click', function (event) {
+          if (event.target === otpModal) {
+            closeOtpModal();
+          }
+        });
+      }
+
+      if (otpModal && otpModal.classList.contains('otp-modal--visible')) {
+        openOtpModal();
+      }
     })();
   </script>
 
